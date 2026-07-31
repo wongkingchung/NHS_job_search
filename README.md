@@ -11,10 +11,14 @@ A small Python scraper that searches [NHS Jobs](https://www.jobs.nhs.uk) for rot
 5. Downloads supporting documents (PDF/DOC/DOCX) attached to each advert.
 6. Extracts text from the documents and the advert page.
 7. Visits each employer's listed website and summarises key trust information.
-8. Writes:
-   - `output/jobs_report.md` — human-readable report with a job list, key-point summaries, and trust summary.
-   - `output/jobs_data.json` — structured data for further processing.
+8. Tracks processed job references so duplicates are skipped in future runs.
+9. Writes (report files include the run date as `YYYYMMDD`):
+   - `output/jobs_report_YYYYMMDD.html` — styled HTML report; open in any browser.
+   - `output/jobs_report_YYYYMMDD.md` — plain Markdown version of the report.
+   - `output/jobs_data.json` — cumulative structured data for all unique jobs.
+   - `output/seen_references.json` — list of references already processed.
    - `output/documents/` — downloaded supporting documents.
+
 
 ## Requirements
 
@@ -22,10 +26,17 @@ A small Python scraper that searches [NHS Jobs](https://www.jobs.nhs.uk) for rot
 - Windows (the legacy `.doc` extractor uses Microsoft Word COM if available)
 - Dependencies listed in `requirements.txt`
 
-Install dependencies:
+Create and use a project virtual environment (recommended):
 
 ```bash
-python -m pip install -r requirements.txt
+python -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+```
+
+Then run the scraper with the venv interpreter:
+
+```bash
+.venv\Scripts\python nhs_job_search.py
 ```
 
 ## Configuration
@@ -75,8 +86,10 @@ python nhs_job_search.py
 
 ## Output
 
-- `output/jobs_report.md` — the main report to review.
-- `output/jobs_data.json` — raw scraped data.
+- `output/jobs_report_YYYYMMDD.html` — the main report; double-click to open in your browser.
+- `output/jobs_report_YYYYMMDD.md` — Markdown version of the report.
+- `output/jobs_data.json` — cumulative raw scraped data for all unique jobs seen so far.
+- `output/seen_references.json` — references already processed, with date scraped, job title, and trust name; used to skip duplicates.
 - `output/documents/` — downloaded files named by job reference.
 
 ## Important notes
@@ -86,3 +99,4 @@ python nhs_job_search.py
 - The filters applied are: title/page text must relate to physiotherapy, mention **Band 5**, and mention **rotational**. Adverts that mention higher bands (e.g., Band 6, 7) are excluded.
 - Exclusion terms are matched against the **job title** so that general rotational posts which mention an excluded specialty in the body text are not removed.
 - Trust website summaries are best-effort extracts from the employer's homepage.
+- Reports and `jobs_data.json` are cumulative: each run adds only new, unique jobs and keeps all previously seen ones.

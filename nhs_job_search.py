@@ -14,6 +14,7 @@ Configuration (credentials are only required if you want to log in):
 """
 
 import configparser
+import datetime
 import hashlib
 import io
 import json
@@ -36,8 +37,8 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.ini"
 OUTPUT_DIR = BASE_DIR / "output"
 DOCS_DIR = OUTPUT_DIR / "documents"
-REPORT_PATH = OUTPUT_DIR / "jobs_report.md"
 JSON_PATH = OUTPUT_DIR / "jobs_data.json"
+SEEN_REFS_PATH = OUTPUT_DIR / "seen_references.json"
 
 BASE_URL = "https://www.jobs.nhs.uk"
 SEARCH_PATH = "/candidate/search/results"
@@ -120,6 +121,55 @@ def contains_excluded_term(text: str, exclude_terms: list) -> bool:
         return False
     lowered = text.lower()
     return any(term in lowered for term in exclude_terms)
+
+
+def load_seen_references(path: Path) -> dict:
+    """
+    Load previously processed job references as a dict.
+
+    Returns {reference: metadata_dict}. Supports the old flat-list format for
+    backward compatibility.
+    """
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            result = {}
+            for item in data:
+                if isinstance(item, dict) and item.get("reference"):
+                    result[item["reference"]] = item
+                elif isinstance(item, str):
+                    # Backward compatibility: old format stored just references.
+                    result[item] = {
+                        "reference": item,
+                        "date_scraped": "",
+                        "title": "",
+                        "trust": "",
+                    }
+            return result
+    except Exception:
+        pass
+    return {}
+
+
+def save_seen_references(path: Path, references: dict) -> None:
+    """Persist processed job references with metadata, sorted by reference."""
+    entries = sorted(references.values(), key=lambda x: x.get("reference", ""))
+    path.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_existing_jobs(path: Path) -> list:
+    """Load previously saved job data so reports can be cumulative."""
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return []
 
 
 def is_physiotherapy(text: str) -> bool:
@@ -683,6 +733,121 @@ def write_report(jobs: list, keyword: str, output_path: Path) -> None:
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def write_html_report(jobs: list, keyword: str, output_path: Path) -> None:
+    """Generate a styled HTML report for browser reading."""
+
+    def html_escape(text: str) -> str:
+        return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def para(text: str) -> str:
+        return f"<p>{html_escape(text)}</p>" if text else ""
+
+    def bullet_list(text: str) -> str:
+        if not text:
+            return ""
+        items = [line[2:].strip() for line in text.splitlines() if line.strip().startswith("- ")]
+        if not items:
+            return para(text)
+        return "<ul>" + "".join(f"<li>{html_escape(item)}</li>" for item in items) + "</ul>"
+
+    head = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NHS Jobs Search Report</title>
+    <style>
+        :root { --nhs-blue: #005eb8; --nhs-dark-blue: #003087; --nhs-light-grey: #f0f4f5; }
+        body { font-family: Arial, Helvetica, sans-serif; line-height: 1.6; max-width: 900px; margin: 0 auto; padding: 20px; color: #212b32; }
+        h1 { color: var(--nhs-blue); border-bottom: 4px solid var(--nhs-blue); padding-bottom: 10px; }
+        h2 { color: var(--nhs-dark-blue); margin-top: 40px; border-left: 6px solid var(--nhs-blue); padding-left: 12px; }
+        h3 { color: var(--nhs-blue); margin-top: 28px; }
+        h4 { color: #4c6272; margin-top: 20px; }
+        .meta { background: var(--nhs-light-grey); padding: 16px; border-radius: 4px; margin-bottom: 20px; }
+        .meta ul { list-style: none; padding: 0; margin: 0; }
+        .meta li { margin-bottom: 6px; }
+        .meta a { color: var(--nhs-blue); }
+        .trust { background: #fff9c4; padding: 14px; border-radius: 4px; margin-top: 20px; }
+        ul { padding-left: 20px; }
+        li { margin-bottom: 8px; }
+        hr { border: 0; border-top: 1px solid #d8dde0; margin: 40px 0; }
+        .section-heading { font-weight: bold; color: #4c6272; margin-top: 14px; }
+    </style>
+</head>
+<body>
+"""
+
+    body_lines = [
+        "<h1>NHS Jobs Search Report</h1>",
+        f'<p><strong>Search term:</strong> {html_escape(keyword)}</p>',
+        f'<p><strong>Jobs found:</strong> {len(jobs)}</p>',
+    ]
+
+    for idx, job in enumerate(jobs, 1):
+        body_lines.append(f'<h2>{idx}. {html_escape(job["title"])}</h2>')
+        body_lines.append('<div class="meta">')
+        body_lines.append("<ul>")
+        body_lines.append(f'<li><strong>Reference:</strong> {html_escape(job.get("reference", ""))}</li>')
+        body_lines.append(f'<li><strong>Employer:</strong> {html_escape(job.get("employer", ""))}</li>')
+        body_lines.append(f'<li><strong>Location:</strong> {html_escape(job.get("location", ""))}</li>')
+        body_lines.append(f'<li><strong>Salary:</strong> {html_escape(job.get("salary", ""))}</li>')
+        body_lines.append(f'<li><strong>Contract type:</strong> {html_escape(job.get("contract_type", ""))}</li>')
+        body_lines.append(f'<li><strong>Working pattern:</strong> {html_escape(job.get("working_pattern", ""))}</li>')
+        body_lines.append(f'<li><strong>Closing date:</strong> {html_escape(job.get("closing_date", ""))}</li>')
+        advert_url = job.get("url", "")
+        body_lines.append(f'<li><strong>Advert URL:</strong> <a href="{html_escape(advert_url)}" target="_blank">{html_escape(advert_url)}</a></li>')
+        body_lines.append("</ul>")
+        body_lines.append("</div>")
+
+        body_lines.append("<h3>Key points from the advert</h3>")
+        page_summary = summarise_text(job.get("details", {}).get("page_text", ""))
+        body_lines.append(bullet_list(page_summary))
+
+        docs = job.get("details", {}).get("documents", [])
+        body_lines.append("<h3>Supporting documents</h3>")
+        if docs:
+            for doc in docs:
+                filename = doc.get("filename", "Unknown")
+                body_lines.append(f'<h4>{html_escape(filename)}</h4>')
+                doc_text = doc.get("text", "")
+                if doc_text:
+                    sections = extract_sections(doc_text)
+                    if sections:
+                        for heading, section_text in sections.items():
+                            if section_text:
+                                body_lines.append(f'<div class="section-heading">{html_escape(heading)}</div>')
+                                body_lines.append(bullet_list(summarise_text(section_text, max_sentences=8)))
+                    else:
+                        body_lines.append(bullet_list(summarise_text(doc_text, max_sentences=10)))
+                else:
+                    body_lines.append("<p><em>No text could be extracted from this document.</em></p>")
+        else:
+            body_lines.append("<p><em>No supporting documents listed.</em></p>")
+
+        trust = job.get("trust_summary", {})
+        if trust:
+            body_lines.append('<div class="trust">')
+            body_lines.append("<h3>About the trust</h3>")
+            trust_url = trust.get("url", "")
+            trust_title = trust.get("title", "")
+            if trust_title:
+                body_lines.append(f"<p><strong>{html_escape(trust_title)}</strong></p>")
+            if trust_url:
+                body_lines.append(f'<p>Website: <a href="{html_escape(trust_url)}" target="_blank">{html_escape(trust_url)}</a></p>')
+            trust_summary = trust.get("summary", "")
+            trust_error = trust.get("error", "")
+            if trust_summary:
+                body_lines.append(bullet_list(trust_summary))
+            elif trust_error:
+                body_lines.append(f"<p><em>Could not retrieve trust website: {html_escape(trust_error)}</em></p>")
+            body_lines.append("</div>")
+
+        body_lines.append("<hr>")
+
+    html = head + "\n".join(body_lines) + "\n</body>\n</html>\n"
+    output_path.write_text(html, encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -733,11 +898,31 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
+    seen_refs = load_seen_references(SEEN_REFS_PATH)
+    if seen_refs:
+        print(f"{len(seen_refs)} job reference(s) already processed in previous runs will be skipped.")
+
+    # Load previously saved jobs so the report stays cumulative across runs.
+    existing_jobs = {j.get("reference", ""): j for j in load_existing_jobs(JSON_PATH)}
+
+    # Backfill title/trust for older seen-references entries that only stored refs.
+    for ref, entry in seen_refs.items():
+        if ref in existing_jobs:
+            job = existing_jobs[ref]
+            if not entry.get("title"):
+                entry["title"] = job.get("title", "")
+            if not entry.get("trust"):
+                entry["trust"] = job.get("employer", "")
+
     jobs = []
     for i, job in enumerate(candidates, 1):
         if len(jobs) >= max_jobs:
             break
-        print(f"[{i}/{len(candidates)}] Processing {job['reference']} - {job['title']}")
+        ref = job.get("reference", "")
+        if ref and ref in seen_refs:
+            print(f"[{i}/{len(candidates)}] Skipping {ref} - already processed.")
+            continue
+        print(f"[{i}/{len(candidates)}] Processing {ref} - {job['title']}")
         try:
             details = client.fetch_job_details(job["url"])
             combined_text = f"{job.get('title', '')} {details.get('page_text', '')}"
@@ -774,6 +959,13 @@ def main():
                 job["trust_summary"] = {"url": "", "title": "", "summary": "", "error": "No website listed."}
 
             jobs.append(job)
+            if ref:
+                seen_refs[ref] = {
+                    "reference": ref,
+                    "date_scraped": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "title": job.get("title", ""),
+                    "trust": job.get("employer", ""),
+                }
 
             for doc in details.get("documents", []):
                 try:
@@ -794,17 +986,34 @@ def main():
             print(f"  Could not fetch details for {job['reference']}: {exc}", file=sys.stderr)
             job["details"] = {"error": str(exc)}
 
-    print(f"Kept {len(jobs)} matching jobs.")
+    print(f"Kept {len(jobs)} new matching job(s).")
+
+    # Persist references so future runs skip duplicates.
+    save_seen_references(SEEN_REFS_PATH, seen_refs)
+
+    # Merge new jobs into existing data so reports are cumulative.
+    for job in jobs:
+        ref = job.get("reference", "")
+        if ref:
+            existing_jobs[ref] = job
+    all_jobs = list(existing_jobs.values())
 
     # Save structured data.
-    JSON_PATH.write_text(json.dumps(jobs, indent=2, ensure_ascii=False), encoding="utf-8")
+    JSON_PATH.write_text(json.dumps(all_jobs, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    # Save human-readable report.
-    write_report(jobs, keyword, REPORT_PATH)
+    # Save human-readable reports with YYYYMMDD suffix for easy reference.
+    today = datetime.datetime.now().strftime("%Y%m%d")
+    report_path = OUTPUT_DIR / f"jobs_report_{today}.md"
+    html_report_path = OUTPUT_DIR / f"jobs_report_{today}.html"
+    write_report(all_jobs, keyword, report_path)
+    write_html_report(all_jobs, keyword, html_report_path)
 
-    print(f"\nDone. Report saved to: {REPORT_PATH}")
-    print(f"Raw data saved to: {JSON_PATH}")
-    print(f"Downloaded documents saved to: {DOCS_DIR}")
+    print(f"\nDone. Cumulative unique jobs in report: {len(all_jobs)}")
+    print(f"Markdown report: {report_path}")
+    print(f"HTML report:     {html_report_path}")
+    print(f"Raw data:        {JSON_PATH}")
+    print(f"Documents:       {DOCS_DIR}")
+    print(f"Seen references: {SEEN_REFS_PATH}")
 
 
 if __name__ == "__main__":
