@@ -12,9 +12,8 @@ A small Python scraper that searches [NHS Jobs](https://www.jobs.nhs.uk) for rot
 6. Extracts text from the documents and the advert page.
 7. Visits each employer's listed website and summarises key trust information.
 8. Tracks processed job references so duplicates are skipped in future runs.
-9. Writes (report files include the run date as `YYYYMMDD`):
+9. Writes (report file includes the run date as `YYYYMMDD`):
    - `output/jobs_report_YYYYMMDD.html` — styled HTML report; open in any browser.
-   - `output/jobs_report_YYYYMMDD.md` — plain Markdown version of the report.
    - `output/jobs_data.json` — cumulative structured data for all unique jobs.
    - `output/seen_references.json` — list of references already processed.
    - `output/documents/` — downloaded supporting documents.
@@ -87,7 +86,6 @@ python nhs_job_search.py
 ## Output
 
 - `output/jobs_report_YYYYMMDD.html` — the main report; double-click to open in your browser.
-- `output/jobs_report_YYYYMMDD.md` — Markdown version of the report.
 - `output/jobs_data.json` — cumulative raw scraped data for all unique jobs seen so far.
 - `output/seen_references.json` — references already processed, with date scraped, job title, and trust name; used to skip duplicates.
 - `output/documents/` — downloaded files named by job reference.

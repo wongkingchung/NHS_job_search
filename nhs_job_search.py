@@ -647,109 +647,6 @@ def extract_text_from_bytes(data: bytes, filename: str) -> str:
 # ---------------------------------------------------------------------------
 # Report generation
 # ---------------------------------------------------------------------------
-def write_report(jobs: list, keyword: str, output_path: Path) -> None:
-    lines = [
-        "# NHS Jobs Search Report",
-        "",
-        f"Search term: **{keyword}**",
-        f"Jobs found: {len(jobs)}",
-        "",
-        "---",
-        "",
-    ]
-
-    # Table of contents with clickable links to each job detail.
-    if jobs:
-        lines.append("## Job list")
-        lines.append("")
-        lines.append("| # | Job title | Trust | Closing date |")
-        lines.append("|---|-----------|-------|--------------|")
-        for idx, job in enumerate(jobs, 1):
-            title = job.get("title", "").replace("|", "\\|")
-            trust = job.get("employer", "").replace("|", "\\|")
-            closing = job.get("closing_date", "").replace("|", "\\|")
-            lines.append(f"| {idx} | [{title}](#job-{idx}) | {trust} | {closing} |")
-        lines.append("")
-        lines.append("---")
-        lines.append("")
-
-    for idx, job in enumerate(jobs, 1):
-        # Anchor for the table-of-contents link.
-        lines.append(f'<a id="job-{idx}"></a>')
-        lines.extend([
-            f"## {idx}. {job['title']}",
-            "",
-            f"- **Reference:** {job.get('reference', '')}",
-            f"- **Employer:** {job.get('employer', '')}",
-            f"- **Location:** {job.get('location', '')}",
-            f"- **Salary:** {job.get('salary', '')}",
-            f"- **Contract type:** {job.get('contract_type', '')}",
-            f"- **Working pattern:** {job.get('working_pattern', '')}",
-            f"- **Closing date:** {job.get('closing_date', '')}",
-            f"- **Advert URL:** {job.get('url', '')}",
-            "",
-            "### Key points from the advert",
-            "",
-        ])
-
-        page_summary = summarise_text(job.get("details", {}).get("page_text", ""))
-        lines.append(page_summary)
-        lines.append("")
-
-        docs = job.get("details", {}).get("documents", [])
-        if docs:
-            lines.append("### Supporting documents")
-            lines.append("")
-            for doc in docs:
-                filename = doc.get("filename", "Unknown")
-                doc_text = doc.get("text", "")
-                lines.append(f"#### {filename}")
-                lines.append("")
-                if doc_text:
-                    sections = extract_sections(doc_text)
-                    if sections:
-                        for heading, section_text in sections.items():
-                            if section_text:
-                                lines.append(f"**{heading}**")
-                                lines.append("")
-                                lines.append(summarise_text(section_text, max_sentences=8))
-                                lines.append("")
-                    else:
-                        lines.append(summarise_text(doc_text, max_sentences=10))
-                        lines.append("")
-                else:
-                    lines.append("_No text could be extracted from this document._")
-                    lines.append("")
-        else:
-            lines.append("_No supporting documents listed._")
-            lines.append("")
-
-        trust = job.get("trust_summary", {})
-        if trust:
-            lines.append("### About the trust")
-            lines.append("")
-            trust_url = trust.get("url", "")
-            trust_title = trust.get("title", "")
-            if trust_title:
-                lines.append(f"**{trust_title}**")
-            if trust_url:
-                lines.append(f"Website: {trust_url}")
-            trust_summary = trust.get("summary", "")
-            trust_error = trust.get("error", "")
-            if trust_summary:
-                lines.append("")
-                lines.append(trust_summary)
-            elif trust_error:
-                lines.append("")
-                lines.append(f"_Could not retrieve trust website: {trust_error}_")
-            lines.append("")
-
-        lines.append("---")
-        lines.append("")
-
-    output_path.write_text("\n".join(lines), encoding="utf-8")
-
-
 def write_html_report(jobs: list, keyword: str, output_path: Path) -> None:
     """Generate a styled HTML report for browser reading."""
 
@@ -1040,16 +937,13 @@ def main():
     # Save structured data.
     JSON_PATH.write_text(json.dumps(all_jobs, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    # Save human-readable reports with YYYYMMDD suffix for easy reference.
+    # Save HTML report with YYYYMMDD suffix for easy reference.
     today = datetime.datetime.now().strftime("%Y%m%d")
-    report_path = OUTPUT_DIR / f"jobs_report_{today}.md"
     html_report_path = OUTPUT_DIR / f"jobs_report_{today}.html"
-    write_report(all_jobs, keyword, report_path)
     write_html_report(all_jobs, keyword, html_report_path)
 
     print(f"\nDone. Cumulative unique jobs in report: {len(all_jobs)}")
-    print(f"Markdown report: {report_path}")
-    print(f"HTML report:     {html_report_path}")
+    print(f"HTML report: {html_report_path}")
     print(f"Raw data:        {JSON_PATH}")
     print(f"Documents:       {DOCS_DIR}")
     print(f"Seen references: {SEEN_REFS_PATH}")
