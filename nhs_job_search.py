@@ -658,7 +658,24 @@ def write_report(jobs: list, keyword: str, output_path: Path) -> None:
         "",
     ]
 
+    # Table of contents with clickable links to each job detail.
+    if jobs:
+        lines.append("## Job list")
+        lines.append("")
+        lines.append("| # | Job title | Trust | Closing date |")
+        lines.append("|---|-----------|-------|--------------|")
+        for idx, job in enumerate(jobs, 1):
+            title = job.get("title", "").replace("|", "\\|")
+            trust = job.get("employer", "").replace("|", "\\|")
+            closing = job.get("closing_date", "").replace("|", "\\|")
+            lines.append(f"| {idx} | [{title}](#job-{idx}) | {trust} | {closing} |")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
     for idx, job in enumerate(jobs, 1):
+        # Anchor for the table-of-contents link.
+        lines.append(f'<a id="job-{idx}"></a>')
         lines.extend([
             f"## {idx}. {job['title']}",
             "",
@@ -772,6 +789,11 @@ def write_html_report(jobs: list, keyword: str, output_path: Path) -> None:
         li { margin-bottom: 8px; }
         hr { border: 0; border-top: 1px solid #d8dde0; margin: 40px 0; }
         .section-heading { font-weight: bold; color: #4c6272; margin-top: 14px; }
+        table.toc { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
+        table.toc th, table.toc td { text-align: left; padding: 10px; border-bottom: 1px solid #d8dde0; }
+        table.toc th { background: var(--nhs-light-grey); }
+        table.toc a { color: var(--nhs-blue); text-decoration: none; }
+        table.toc a:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
@@ -783,7 +805,24 @@ def write_html_report(jobs: list, keyword: str, output_path: Path) -> None:
         f'<p><strong>Jobs found:</strong> {len(jobs)}</p>',
     ]
 
+    # Table of contents with clickable links to each job detail.
+    if jobs:
+        body_lines.append("<h2>Job list</h2>")
+        body_lines.append('<table class="toc"><thead><tr><th>#</th><th>Job title</th><th>Trust</th><th>Closing date</th></tr></thead><tbody>')
+        for idx, job in enumerate(jobs, 1):
+            body_lines.append(
+                f'<tr>'
+                f'<td>{idx}</td>'
+                f'<td><a href="#job-{idx}">{html_escape(job.get("title", ""))}</a></td>'
+                f'<td>{html_escape(job.get("employer", ""))}</td>'
+                f'<td>{html_escape(job.get("closing_date", ""))}</td>'
+                f'</tr>'
+            )
+        body_lines.append("</tbody></table>")
+        body_lines.append("<hr>")
+
     for idx, job in enumerate(jobs, 1):
+        body_lines.append(f'<a id="job-{idx}"></a>')
         body_lines.append(f'<h2>{idx}. {html_escape(job["title"])}</h2>')
         body_lines.append('<div class="meta">')
         body_lines.append("<ul>")
