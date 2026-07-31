@@ -1,0 +1,811 @@
+#!/usr/bin/env python3
+"""
+NHS Jobs scraper.
+
+Searches NHS Jobs for "rotational band 5 physiotherapist", scrapes job
+listings, downloads supporting documents from each advert and writes a
+Markdown report summarising the key points.
+
+Configuration (credentials are only required if you want to log in):
+    [Login]
+    url=https://www.jobs.nhs.uk/candidate/search
+    email=<your email>
+    pwd=<your password>
+"""
+
+import configparser
+import hashlib
+import io
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urljoin, urlencode, urlparse, parse_qs
+
+import requests
+from bs4 import BeautifulSoup
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / "config.ini"
+OUTPUT_DIR = BASE_DIR / "output"
+DOCS_DIR = OUTPUT_DIR / "documents"
+REPORT_PATH = OUTPUT_DIR / "jobs_report.md"
+JSON_PATH = OUTPUT_DIR / "jobs_data.json"
+
+BASE_URL = "https://www.jobs.nhs.uk"
+SEARCH_PATH = "/candidate/search/results"
+LOGIN_PATH = "/candidate/auth/login"
+
+REQUEST_DELAY = 1.0  # seconds between requests to be polite
+MAX_RETRIES = 3
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+# Keywords used to highlight the most relevant sentences when summarising.
+KEY_PHRASES = [
+    "essential", "desirable", "requirement", "qualification", "degree",
+    "registered", "hcpc", "csp", "experience", "skill", "knowledge",
+    "ability", "responsibility", "duty", "main duties", "job summary",
+    "person specification", "band 5", "rotational", "physiotherapist",
+    "assessment", "treatment", "rehabilitation", "multidisciplinary",
+    "communication", "team", "patient", "clinical", "caseload",
+    "mentorship", "supervision", "appraisal", "training", "development",
+]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def clean_text(text: str) -> str:
+    """Normalise whitespace in a string."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def score_sentence(sentence: str) -> int:
+    """Score a sentence by how many key job-related words it contains."""
+    lowered = sentence.lower()
+    return sum(1 for phrase in KEY_PHRASES if phrase in lowered)
+
+
+def summarise_text(text: str, max_sentences: int = 12) -> str:
+    """
+    Simple extractive summary.
+
+    Splits the text into sentences, scores each sentence by the presence of
+    job-relevant keywords, and returns the top scoring sentences in their
+    original order.
+    """
+    if not text:
+        return "No text available to summarise."
+
+    # Split on sentence endings while keeping the delimiters.
+    raw_sentences = re.split(r"(?<=[.!?])\s+", text.replace("\n", " "))
+    sentences = [clean_text(s) for s in raw_sentences if len(s.split()) > 4]
+
+    if not sentences:
+        return clean_text(text)[:1000]
+
+    scored = [(i, score_sentence(s), s) for i, s in enumerate(sentences)]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    top = scored[:max_sentences]
+    top.sort(key=lambda x: x[0])  # restore original order
+    return "\n".join(f"- {s}" for _, _, s in top)
+
+
+def is_rotational(text: str) -> bool:
+    """Return True if the text suggests this is a rotational post."""
+    return bool(text) and "rotational" in text.lower()
+
+
+def parse_exclude_terms(terms: str) -> list:
+    """Parse a comma-separated exclusion list into normalised tokens."""
+    if not terms:
+        return []
+    return [t.strip().lower() for t in terms.split(",") if t.strip()]
+
+
+def contains_excluded_term(text: str, exclude_terms: list) -> bool:
+    """Return True if text contains any of the excluded terms."""
+    if not text or not exclude_terms:
+        return False
+    lowered = text.lower()
+    return any(term in lowered for term in exclude_terms)
+
+
+def is_physiotherapy(text: str) -> bool:
+    """Return True if the text relates to physiotherapy."""
+    if not text:
+        return False
+    lowered = text.lower()
+    return "physiotherapist" in lowered or "physiotherapy" in lowered or "physio" in lowered
+
+
+def is_band_5(text: str) -> bool:
+    """Return True if the text clearly indicates a Band 5 post."""
+    if not text:
+        return False
+    lowered = text.lower()
+    return "band 5" in lowered or "band5" in lowered
+
+
+def is_unwanted_band(text: str) -> bool:
+    """Return True if the text mentions a higher band that would exclude Band 5."""
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(f"band {b}" in lowered for b in (6, 7, 8, 9)) or "band 6" in lowered
+
+
+def parse_document_filename(value: str) -> str:
+    """
+    NHS document button values look like:
+        '229-IC-7485068 JDPS.doc (DOC, 668 KB)'
+        'Information for Sponsorship (PDF, 206 KB)'
+    Return a sensible filename with extension, e.g. '229-IC-7485068 JDPS.doc'
+    or 'Information for Sponsorship.pdf'.
+    """
+    value = clean_text(value)
+
+    # Capture the document type from any '(TYPE, size)' metadata before removing it.
+    type_match = re.search(r"\((PDF|DOC|DOCX)", value, re.IGNORECASE)
+    inferred_ext = type_match.group(1).lower() if type_match else None
+
+    # Trim metadata parentheses from the end.
+    value = re.sub(r"\s*\([^)]*\)\s*$", "", value).strip()
+
+    # If an extension is already present, use it.
+    if re.search(r"\.(docx?|pdf)$", value, re.IGNORECASE):
+        return value
+
+    ext = inferred_ext or "bin"
+    return f"{value}.{ext}"
+
+
+def extract_sections(text: str) -> dict:
+    """
+    Try to split a document into common NHS job-description sections.
+    Returns a dict of section heading -> paragraph text.
+    """
+    section_names = [
+        "job summary", "main duties", "responsibilities", "person specification",
+        "education", "qualifications", "skills", "knowledge", "abilities",
+        "experience", "disclosure", "registration",
+    ]
+
+    # Heuristic: look for lines that look like section headings.
+    pattern = re.compile(
+        r"(?:\n|\r|^)\s*(" + "|".join(re.escape(s) for s in section_names) + r")",
+        re.IGNORECASE,
+    )
+    parts = pattern.split(text)
+    sections = {}
+    current_heading = "Overview"
+    for part in parts:
+        if part is None:
+            continue
+        if re.match(
+            r"(?:" + "|".join(re.escape(s) for s in section_names) + r")",
+            part,
+            re.IGNORECASE,
+        ):
+            current_heading = part.strip().title()
+            sections.setdefault(current_heading, [])
+        else:
+            sections.setdefault(current_heading, []).append(part.strip())
+
+    return {k: clean_text("\n".join(v)) for k, v in sections.items() if v}
+
+
+# ---------------------------------------------------------------------------
+# NHS Jobs client
+# ---------------------------------------------------------------------------
+class NHSJobsClient:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-GB,en;q=0.9",
+        })
+
+    def _get(self, url: str, timeout: int = 30, **kwargs) -> requests.Response:
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = self.session.get(url, timeout=timeout, **kwargs)
+                resp.raise_for_status()
+                time.sleep(REQUEST_DELAY)
+                return resp
+            except requests.RequestException as exc:
+                if attempt == MAX_RETRIES - 1:
+                    raise
+                time.sleep(2 ** attempt)
+
+    def _post(self, url: str, data: dict, timeout: int = 30, **kwargs) -> requests.Response:
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = self.session.post(url, data=data, timeout=timeout, **kwargs)
+                resp.raise_for_status()
+                time.sleep(REQUEST_DELAY)
+                return resp
+            except requests.RequestException as exc:
+                if attempt == MAX_RETRIES - 1:
+                    raise
+                time.sleep(2 ** attempt)
+
+    def login(self, email: str, password: str) -> bool:
+        """
+        Optional login. NHS Jobs search is public, but this is provided if
+        you want to access candidate-only features later.
+        """
+        login_url = urljoin(BASE_URL, LOGIN_PATH)
+        # Fetch the login page to obtain CSRF token and cookies.
+        resp = self._get(login_url)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        csrf = soup.find("input", {"name": "_csrf"})
+        csrf_token = csrf["value"] if csrf else None
+
+        if not csrf_token:
+            print("Warning: could not find login CSRF token.", file=sys.stderr)
+            return False
+
+        payload = {
+            "_csrf": csrf_token,
+            "email": email,
+            "password": password,
+        }
+        resp = self._post(login_url, data=payload, allow_redirects=True)
+        # A successful login redirects away from the login page.
+        return LOGIN_PATH not in resp.url
+
+    def search_jobs(
+        self,
+        keyword: str,
+        search_url: str = "",
+        max_candidates: int = 50,
+        max_pages: int = 20,
+    ) -> list:
+        """
+        Search NHS Jobs and return candidate job dictionaries.
+
+        If `search_url` is supplied it is used as the base query URL and its
+        query parameters are preserved while paging. Otherwise a default URL
+        is built from `keyword` plus Band 5 / Allied Health Professionals
+        filters. The caller is expected to fetch details and apply stricter
+        text filters.
+        """
+        candidates = []
+        page = 1
+
+        # Parse the supplied search URL, or build a default one.
+        if search_url:
+            parsed = urlparse(search_url)
+            base_path = parsed.path or SEARCH_PATH
+            base_params = parse_qs(parsed.query, keep_blank_values=True)
+            # parse_qs returns lists; flatten single-value params.
+            base_params = {k: v[0] if len(v) == 1 else v for k, v in base_params.items()}
+        else:
+            base_path = SEARCH_PATH
+            base_params = {
+                "keyword": keyword,
+                "language": "en",
+                "searchFormType": "main",
+                "payBand": "BAND_5",
+                "staffGroup": "ALLIED_HEALTH_PROF",
+            }
+
+        while len(candidates) < max_candidates and page <= max_pages:
+            params = dict(base_params)
+            params["page"] = page
+            url = urljoin(BASE_URL, base_path) + "?" + urlencode(params)
+            print(f"Fetching search page {page}...")
+            resp = self._get(url)
+            soup = BeautifulSoup(resp.text, "html.parser")
+            results = soup.find("ul", class_="search-results")
+            if not results:
+                break
+
+            items = results.find_all("li", class_="search-result")
+            if not items:
+                break
+
+            for item in items:
+                if len(candidates) >= max_candidates:
+                    break
+                job = self._parse_search_result(item)
+                if not job:
+                    continue
+                # The NHS keyword search matches many therapist roles; keep
+                # only physiotherapy-related Band 5 titles as candidates.
+                title = job.get("title", "")
+                if is_physiotherapy(title) and not is_unwanted_band(title):
+                    candidates.append(job)
+
+            # Stop if there is no "next" page link.
+            next_link = soup.find("a", class_="nhsuk-pagination__link--next")
+            if not next_link or "disabled" in next_link.get("class", []):
+                break
+            page += 1
+
+        return candidates
+
+    def _parse_search_result(self, item: BeautifulSoup) -> Optional[dict]:
+        title_link = item.find("a", attrs={"data-test": "search-result-job-title"})
+        if not title_link:
+            return None
+
+        href = title_link.get("href", "")
+        relative = href.split("?")[0] if href else ""
+        reference = relative.rsplit("/", 1)[-1] if "/" in relative else ""
+
+        employer_block = item.find("div", attrs={"data-test": "search-result-location"})
+        employer = ""
+        location = ""
+        if employer_block:
+            h3 = employer_block.find("h3")
+            if h3:
+                loc_div = h3.find("div", class_="location-font-size")
+                if loc_div:
+                    location = clean_text(loc_div.get_text(" ", strip=True))
+                    # Text before the location div is the employer name.
+                    prev = loc_div.previous_sibling
+                    employer = clean_text(prev) if prev else ""
+                else:
+                    employer = clean_text(h3.get_text(" ", strip=True))
+
+        def get_info(test_id: str) -> str:
+            el = item.find(attrs={"data-test": test_id})
+            if not el:
+                return ""
+            strong = el.find("strong")
+            if strong:
+                return clean_text(strong.get_text(" ", strip=True))
+            return clean_text(el.get_text(" ", strip=True))
+
+        # Build a clean advert URL without the search page parameter.
+        clean_url = urljoin(BASE_URL, relative)
+
+        return {
+            "title": clean_text(title_link.get_text()),
+            "reference": reference,
+            "url": clean_url,
+            "employer": employer,
+            "location": location,
+            "salary": get_info("search-result-salary"),
+            "date_posted": get_info("search-result-publicationDate"),
+            "closing_date": get_info("search-result-closingDate"),
+            "contract_type": get_info("search-result-jobType"),
+            "working_pattern": get_info("search-result-workingPattern"),
+        }
+
+    def fetch_job_details(self, job_url: str) -> dict:
+        """Fetch a job advert and extract details + supporting documents."""
+        resp = self._get(job_url)
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        details = {
+            "page_text": "",
+            "documents": [],
+        }
+
+        # Main advert text is inside <main>.
+        main = soup.find("main")
+        if main:
+            details["page_text"] = clean_text(main.get_text(" ", strip=True))
+
+        # Structured fields from the Details panel.
+        def detail_value(label: str) -> str:
+            for dt in soup.find_all("dt"):
+                if label.lower() in dt.get_text(strip=True).lower():
+                    dd = dt.find_next_sibling("dd")
+                    if dd:
+                        return clean_text(dd.get_text(" ", strip=True))
+            return ""
+
+        details["pay_scheme"] = detail_value("Pay scheme")
+        details["band"] = detail_value("Band")
+        details["salary"] = detail_value("Salary")
+        details["contract"] = detail_value("Contract")
+        details["duration"] = detail_value("Duration")
+        details["working_pattern"] = detail_value("Working pattern")
+        details["reference_number"] = detail_value("Reference number")
+
+        # Employer's website link (for trust-value drilling).
+        details["employer_website"] = ""
+        website_heading = soup.find("h3", id="employer_website_heading")
+        if website_heading:
+            website_p = website_heading.find_next_sibling("p", id="employer_website_url")
+            if website_p:
+                link = website_p.find("a", href=True)
+                if link:
+                    details["employer_website"] = urljoin(job_url, link["href"])
+                else:
+                    details["employer_website"] = clean_text(website_p.get_text(" ", strip=True))
+
+        # Supporting documents are POST forms; collect CSRF + document id.
+        docs_heading = soup.find("h3", id="supporting_documents_heading")
+        if docs_heading:
+            for form in docs_heading.find_all_next("form", method="post"):
+                # Stop if we have reached the next content block.
+                if form.find_previous(["h2", "h3"]) != docs_heading:
+                    break
+                csrf_inp = form.find("input", {"name": "_csrf"})
+                doc_inp = form.find("input", {"name": "document"})
+                submit = form.find("input", {"type": "submit"})
+                if csrf_inp and doc_inp and submit:
+                    raw_value = clean_text(submit.get("value", ""))
+                    details["documents"].append({
+                        "filename": parse_document_filename(raw_value),
+                        "submit_value": raw_value,
+                        "csrf": csrf_inp.get("value", ""),
+                        "document_id": doc_inp.get("value", ""),
+                        "submit_id": submit.get("id", ""),
+                    })
+
+        return details
+
+    def download_document(self, job_url: str, doc: dict) -> Optional[bytes]:
+        """Download a supporting document using its form fields."""
+        if not doc.get("csrf") or not doc.get("document_id"):
+            return None
+
+        payload = {
+            "_csrf": doc["csrf"],
+            "document": doc["document_id"],
+        }
+        if doc.get("submit_id"):
+            payload[doc["submit_id"]] = doc.get("submit_value") or doc["filename"]
+
+        headers = {"Referer": job_url}
+        resp = self._post(job_url, data=payload, headers=headers, allow_redirects=True)
+        return resp.content
+
+    def fetch_trust_website_summary(self, url: str) -> dict:
+        """
+        Fetch the trust's public website and extract a short summary.
+
+        Returns a dict with keys: url, title, summary, error.
+        """
+        result = {"url": url, "title": "", "summary": "", "error": ""}
+        if not url or not url.startswith("http"):
+            result["error"] = "No valid trust website URL."
+            return result
+
+        try:
+            resp = self._get(url, timeout=20)
+            soup = BeautifulSoup(resp.text, "html.parser")
+            result["title"] = clean_text(soup.title.string) if soup.title else ""
+
+            # Try to find the main content area, otherwise use the body.
+            main = (
+                soup.find("main")
+                or soup.find("div", class_=re.compile(r"content|main", re.I))
+                or soup.find("body")
+            )
+            if main:
+                text = clean_text(main.get_text(" ", strip=True))
+                result["summary"] = summarise_trust_text(text)
+            else:
+                result["error"] = "Could not find page content."
+        except Exception as exc:
+            result["error"] = str(exc)
+
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Trust website summarisation
+# ---------------------------------------------------------------------------
+TRUST_KEY_PHRASES = [
+    "trust", "hospital", "nhs", "care", "patients", "values", "mission",
+    "vision", "about us", "our services", "excellence", "compassion",
+    "respect", "dignity", "commitment", "quality", "safety", "wellbeing",
+    "staff", "team", "award", "foundation trust", "healthcare", "community",
+    "partnership", "innovation", "improvement",
+]
+
+
+def summarise_trust_text(text: str, max_sentences: int = 8) -> str:
+    """Extractive summary focused on trust identity, values and services."""
+    if not text:
+        return "No content available."
+
+    raw_sentences = re.split(r"(?<=[.!?])\s+", text.replace("\n", " "))
+    sentences = [clean_text(s) for s in raw_sentences if len(s.split()) > 5]
+
+    def score(sentence: str) -> int:
+        lowered = sentence.lower()
+        return sum(1 for phrase in TRUST_KEY_PHRASES if phrase in lowered)
+
+    scored = [(i, score(s), s) for i, s in enumerate(sentences)]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    top = scored[:max_sentences]
+    top.sort(key=lambda x: x[0])
+    return "\n".join(f"- {s}" for _, _, s in top)
+
+
+# ---------------------------------------------------------------------------
+# Document text extraction
+# ---------------------------------------------------------------------------
+def extract_text_from_bytes(data: bytes, filename: str) -> str:
+    """Best-effort text extraction from PDF/DOC/DOCX bytes."""
+    lowered = filename.lower()
+
+    # PDF
+    if lowered.endswith(".pdf") or data[:4] == b"%PDF":
+        try:
+            import PyPDF2
+            reader = PyPDF2.PdfReader(io.BytesIO(data))
+            parts = []
+            for page in reader.pages:
+                try:
+                    parts.append(page.extract_text() or "")
+                except Exception:
+                    pass
+            return "\n".join(parts)
+        except Exception as exc:
+            return f"[Could not extract PDF text: {exc}]"
+
+    # DOCX (often mis-named .doc but is actually a zip)
+    if lowered.endswith(".docx") or data[:2] == b"PK":
+        try:
+            import docx
+            doc = docx.Document(io.BytesIO(data))
+            return "\n".join(p.text for p in doc.paragraphs)
+        except Exception as exc:
+            return f"[Could not extract DOCX text: {exc}]"
+
+    # Legacy .doc - try Microsoft Word via COM on Windows, then textract.
+    if lowered.endswith(".doc"):
+        temp_path = DOCS_DIR / f"_tmp_{hashlib.md5(data).hexdigest()}.doc"
+        temp_path.write_bytes(data)
+        try:
+            try:
+                import win32com.client
+                word = win32com.client.Dispatch("Word.Application")
+                word.Visible = False
+                word.DisplayAlerts = False
+                doc = word.Documents.Open(str(temp_path.resolve()))
+                text = doc.Content.Text
+                doc.Close(SaveChanges=False)
+                word.Quit()
+                return text
+            except Exception:
+                pass
+
+            try:
+                import textract
+                text = textract.process(str(temp_path), extension="doc").decode("utf-8", errors="ignore")
+                return text
+            except Exception:
+                pass
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    return "[Document format not supported for automatic text extraction. File saved for manual review.]"
+
+
+# ---------------------------------------------------------------------------
+# Report generation
+# ---------------------------------------------------------------------------
+def write_report(jobs: list, keyword: str, output_path: Path) -> None:
+    lines = [
+        "# NHS Jobs Search Report",
+        "",
+        f"Search term: **{keyword}**",
+        f"Jobs found: {len(jobs)}",
+        "",
+        "---",
+        "",
+    ]
+
+    for idx, job in enumerate(jobs, 1):
+        lines.extend([
+            f"## {idx}. {job['title']}",
+            "",
+            f"- **Reference:** {job.get('reference', '')}",
+            f"- **Employer:** {job.get('employer', '')}",
+            f"- **Location:** {job.get('location', '')}",
+            f"- **Salary:** {job.get('salary', '')}",
+            f"- **Contract type:** {job.get('contract_type', '')}",
+            f"- **Working pattern:** {job.get('working_pattern', '')}",
+            f"- **Closing date:** {job.get('closing_date', '')}",
+            f"- **Advert URL:** {job.get('url', '')}",
+            "",
+            "### Key points from the advert",
+            "",
+        ])
+
+        page_summary = summarise_text(job.get("details", {}).get("page_text", ""))
+        lines.append(page_summary)
+        lines.append("")
+
+        docs = job.get("details", {}).get("documents", [])
+        if docs:
+            lines.append("### Supporting documents")
+            lines.append("")
+            for doc in docs:
+                filename = doc.get("filename", "Unknown")
+                doc_text = doc.get("text", "")
+                lines.append(f"#### {filename}")
+                lines.append("")
+                if doc_text:
+                    sections = extract_sections(doc_text)
+                    if sections:
+                        for heading, section_text in sections.items():
+                            if section_text:
+                                lines.append(f"**{heading}**")
+                                lines.append("")
+                                lines.append(summarise_text(section_text, max_sentences=8))
+                                lines.append("")
+                    else:
+                        lines.append(summarise_text(doc_text, max_sentences=10))
+                        lines.append("")
+                else:
+                    lines.append("_No text could be extracted from this document._")
+                    lines.append("")
+        else:
+            lines.append("_No supporting documents listed._")
+            lines.append("")
+
+        trust = job.get("trust_summary", {})
+        if trust:
+            lines.append("### About the trust")
+            lines.append("")
+            trust_url = trust.get("url", "")
+            trust_title = trust.get("title", "")
+            if trust_title:
+                lines.append(f"**{trust_title}**")
+            if trust_url:
+                lines.append(f"Website: {trust_url}")
+            trust_summary = trust.get("summary", "")
+            trust_error = trust.get("error", "")
+            if trust_summary:
+                lines.append("")
+                lines.append(trust_summary)
+            elif trust_error:
+                lines.append("")
+                lines.append(f"_Could not retrieve trust website: {trust_error}_")
+            lines.append("")
+
+        lines.append("---")
+        lines.append("")
+
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def load_config(path: Path) -> dict:
+    config = configparser.ConfigParser()
+    if path.exists():
+        config.read(path)
+    return {
+        "url": config.get("Login", "url", fallback=urljoin(BASE_URL, SEARCH_PATH)),
+        "email": config.get("Login", "email", fallback=""),
+        "password": config.get("Login", "pwd", fallback=""),
+        "search_url": config.get("Search", "url", fallback=""),
+        "search_keyword": config.get("Search", "keyword", fallback=""),
+        "exclude_terms": config.get("Search", "exclude", fallback=""),
+    }
+
+
+def main():
+    cfg = load_config(CONFIG_PATH)
+    client = NHSJobsClient()
+
+    # Optional login (searching is public, so this is not required).
+    if cfg.get("email") and cfg.get("password"):
+        print("Attempting optional login...")
+        logged_in = client.login(cfg["email"], cfg["password"])
+        print("Logged in:" if logged_in else "Login failed or not required; continuing with public search.")
+
+    keyword = cfg.get("search_keyword") or os.environ.get("SEARCH_KEYWORD") or "rotational physiotherapist"
+    search_url = cfg.get("search_url") or os.environ.get("SEARCH_URL") or ""
+    exclude_terms = parse_exclude_terms(
+        cfg.get("exclude_terms") or os.environ.get("EXCLUDE_TERMS") or ""
+    )
+    max_jobs = int(os.environ.get("MAX_JOBS", "10"))
+    max_candidates = int(os.environ.get("MAX_CANDIDATES", "50"))
+
+    display_term = keyword if not search_url else (search_url.split("?", 1)[0] if "?" in search_url else search_url)
+    print(f"Searching for: {display_term} (keyword filter: {keyword})")
+    if exclude_terms:
+        print(f"Excluding adverts containing: {', '.join(exclude_terms)}")
+
+    candidates = client.search_jobs(
+        keyword,
+        search_url=search_url,
+        max_candidates=max_candidates,
+    )
+    print(f"Found {len(candidates)} candidate jobs; checking details...")
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    DOCS_DIR.mkdir(parents=True, exist_ok=True)
+
+    jobs = []
+    for i, job in enumerate(candidates, 1):
+        if len(jobs) >= max_jobs:
+            break
+        print(f"[{i}/{len(candidates)}] Processing {job['reference']} - {job['title']}")
+        try:
+            details = client.fetch_job_details(job["url"])
+            combined_text = f"{job.get('title', '')} {details.get('page_text', '')}"
+
+            # Strict filters to ensure we only report rotational Band 5 physiotherapy posts.
+            if not is_physiotherapy(combined_text):
+                print(f"  Skipping {job['reference']}: not physiotherapy-related.")
+                continue
+            if not is_band_5(combined_text):
+                print(f"  Skipping {job['reference']}: not Band 5.")
+                continue
+            if is_unwanted_band(combined_text):
+                print(f"  Skipping {job['reference']}: mentions a higher band.")
+                continue
+            if not is_rotational(combined_text):
+                print(f"  Skipping {job['reference']}: not rotational.")
+                continue
+            # Exclusion terms are matched against the job title so that general
+            # rotational posts which merely mention an excluded specialty in the
+            # body text are not removed.
+            if contains_excluded_term(job.get("title", ""), exclude_terms):
+                matched = [t for t in exclude_terms if t in job.get("title", "").lower()]
+                print(f"  Skipping {job['reference']}: excluded term(s) in title: {', '.join(matched)}.")
+                continue
+
+            job["details"] = details
+
+            # Fetch trust website summary if a URL is present.
+            trust_url = details.get("employer_website", "")
+            if trust_url:
+                print(f"  Fetching trust website: {trust_url}")
+                job["trust_summary"] = client.fetch_trust_website_summary(trust_url)
+            else:
+                job["trust_summary"] = {"url": "", "title": "", "summary": "", "error": "No website listed."}
+
+            jobs.append(job)
+
+            for doc in details.get("documents", []):
+                try:
+                    data = client.download_document(job["url"], doc)
+                    if not data:
+                        continue
+                    safe_name = re.sub(r"[^\w\-. ]", "_", doc["filename"])
+                    safe_name = re.sub(r"[ _]+", "_", safe_name).strip("_.")
+                    safe_name = safe_name or f"doc_{doc['document_id']}"
+                    doc_path = DOCS_DIR / f"{job['reference']}_{safe_name}"
+                    doc_path.write_bytes(data)
+                    doc["saved_path"] = str(doc_path.relative_to(BASE_DIR))
+                    doc["text"] = extract_text_from_bytes(data, doc["filename"])
+                except Exception as exc:
+                    doc["error"] = str(exc)
+                    print(f"  Could not download document {doc.get('filename')}: {exc}", file=sys.stderr)
+        except Exception as exc:
+            print(f"  Could not fetch details for {job['reference']}: {exc}", file=sys.stderr)
+            job["details"] = {"error": str(exc)}
+
+    print(f"Kept {len(jobs)} matching jobs.")
+
+    # Save structured data.
+    JSON_PATH.write_text(json.dumps(jobs, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # Save human-readable report.
+    write_report(jobs, keyword, REPORT_PATH)
+
+    print(f"\nDone. Report saved to: {REPORT_PATH}")
+    print(f"Raw data saved to: {JSON_PATH}")
+    print(f"Downloaded documents saved to: {DOCS_DIR}")
+
+
+if __name__ == "__main__":
+    main()
