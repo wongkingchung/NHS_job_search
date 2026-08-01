@@ -523,6 +523,10 @@ class NHSJobsClient:
         """
         Fetch the trust's public website and extract a short summary.
 
+        Tries to locate an About Us / Values / Mission page from the homepage
+        navigation and summarises that page; falls back to the homepage if no
+        suitable page is found.
+
         Returns a dict with keys: url, title, summary, error.
         """
         result = {"url": url, "title": "", "summary": "", "error": ""}
@@ -530,19 +534,69 @@ class NHSJobsClient:
             result["error"] = "No valid trust website URL."
             return result
 
+        def extract_page_text(page_soup: BeautifulSoup) -> str:
+            main = (
+                page_soup.find("main")
+                or page_soup.find("div", class_=re.compile(r"content|main", re.I))
+                or page_soup.find("body")
+            )
+            if main:
+                return clean_text(main.get_text(" ", strip=True))
+            return ""
+
         try:
+            # Fetch the homepage first.
             resp = self._get(url, timeout=20)
             soup = BeautifulSoup(resp.text, "html.parser")
             result["title"] = clean_text(soup.title.string) if soup.title else ""
 
-            # Try to find the main content area, otherwise use the body.
-            main = (
-                soup.find("main")
-                or soup.find("div", class_=re.compile(r"content|main", re.I))
-                or soup.find("body")
-            )
-            if main:
-                text = clean_text(main.get_text(" ", strip=True))
+            # Look for a trust-values page linked from the homepage.
+            # Priority: most specific values pages first, then general About Us.
+            search_patterns = [
+                r"our\s+values",
+                r"values?\b",
+                r"about\s+us",
+                r"about\b",
+                r"who\s+we\s+are",
+                r"mission",
+                r"vision",
+            ]
+            best_link = None
+            best_score = len(search_patterns)  # lower is better
+
+            for a in soup.find_all("a", href=True):
+                text = clean_text(a.get_text(" ", strip=True)).lower()
+                if not text:
+                    continue
+                for score, pattern in enumerate(search_patterns):
+                    if re.search(pattern, text):
+                        if score < best_score:
+                            best_score = score
+                            href = a["href"].strip()
+                            # Ignore anchors/javascript on the same page.
+                            if href.startswith("#") or href.lower().startswith("javascript:"):
+                                continue
+                            best_link = urljoin(url, href)
+                        break  # only count the highest-priority match for this link
+
+            # If we found a relevant page, fetch and use it.
+            if best_link and best_link != url:
+                try:
+                    inner_resp = self._get(best_link, timeout=20)
+                    inner_soup = BeautifulSoup(inner_resp.text, "html.parser")
+                    text = extract_page_text(inner_soup)
+                    if text:
+                        result["url"] = best_link
+                        result["title"] = clean_text(inner_soup.title.string) if inner_soup.title else result["title"]
+                        result["summary"] = summarise_trust_text(text)
+                        return result
+                except Exception as inner_exc:
+                    # Fall back to homepage summary.
+                    result["error"] = f"Could not fetch values page ({best_link}): {inner_exc}"
+
+            # Fallback: summarise the homepage.
+            text = extract_page_text(soup)
+            if text:
                 result["summary"] = summarise_trust_text(text)
             else:
                 result["error"] = "Could not find page content."
@@ -560,7 +614,8 @@ TRUST_KEY_PHRASES = [
     "vision", "about us", "our services", "excellence", "compassion",
     "respect", "dignity", "commitment", "quality", "safety", "wellbeing",
     "staff", "team", "award", "foundation trust", "healthcare", "community",
-    "partnership", "innovation", "improvement",
+    "partnership", "innovation", "improvement", "integrity", "accountability",
+    "kindness", "patient centred", "person centred", "our purpose",
 ]
 
 

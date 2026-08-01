@@ -96,5 +96,5 @@ python nhs_job_search.py
 - Legacy `.doc` files are extracted using Microsoft Word COM on Windows. If Word is not installed, those files are saved for manual review.
 - The filters applied are: title/page text must relate to physiotherapy, mention **Band 5**, and mention **rotational**. Adverts that mention higher bands (e.g., Band 6, 7) are excluded.
 - Exclusion terms are matched against the **job title** so that general rotational posts which mention an excluded specialty in the body text are not removed.
-- Trust website summaries are best-effort extracts from the employer's homepage.
+- Trust website summaries are best-effort extracts from the employer's **About Us / Values / Vision** page (linked from the homepage), falling back to the homepage if no suitable page is found.
 - Reports and `jobs_data.json` are cumulative: each run adds only new, unique jobs and keeps all previously seen ones.
