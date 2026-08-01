@@ -12,3 +12,8 @@ exclude=respiratory
 provider=kimi.ai
 api_key=your-api-key-here
 model=moonshot-v1-8k
+
+# Optional: when running a PyInstaller-compiled app, set the environment variable
+# NHS_OUTPUT_DIR to force the output folder to a specific path, e.g.
+#   export NHS_OUTPUT_DIR="$HOME/Desktop/NHS_search_output"
+# Otherwise the app will write outputs next to the .app bundle on macOS.

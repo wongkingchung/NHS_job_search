@@ -33,7 +33,44 @@ from bs4 import BeautifulSoup
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent
+def _resolve_base_dir() -> Path:
+    """
+    Determine the directory used for config.ini and the output folder.
+
+    Priority:
+      1. NHS_OUTPUT_DIR environment variable (useful for compiled apps).
+      2. PyInstaller/frozen executable directory.
+         On macOS .app bundles this is the folder containing the .app so
+         outputs appear next to the application rather than inside it.
+      3. Directory containing this script (normal python nhs_job_search.py).
+    """
+    env_dir = os.environ.get("NHS_OUTPUT_DIR")
+    if env_dir:
+        return Path(env_dir).expanduser().resolve()
+
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable).resolve()
+        exe_dir = exe.parent
+        # macOS .app bundle: .../MyApp.app/Contents/MacOS/MyApp
+        # Walk up to the .app container and use its parent directory.
+        if sys.platform == "darwin":
+            current = exe_dir
+            for _ in range(10):  # safety limit
+                if current.name == "Contents":
+                    app_bundle = current.parent
+                    if app_bundle.suffix.lower() == ".app":
+                        return app_bundle.parent
+                    return app_bundle
+                parent = current.parent
+                if parent == current:
+                    break
+                current = parent
+        return exe_dir
+
+    return Path(__file__).resolve().parent
+
+
+BASE_DIR = _resolve_base_dir()
 CONFIG_PATH = BASE_DIR / "config.ini"
 OUTPUT_DIR = BASE_DIR / "output"
 DOCS_DIR = OUTPUT_DIR / "documents"
@@ -958,6 +995,9 @@ def load_config(path: Path) -> dict:
 
 
 def main():
+    print(f"Config path:   {CONFIG_PATH}")
+    print(f"Output folder: {OUTPUT_DIR}")
+
     cfg = load_config(CONFIG_PATH)
     client = NHSJobsClient()
     llm = LLMSummarizer(
