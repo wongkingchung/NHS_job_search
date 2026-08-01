@@ -1,0 +1,14 @@
+[Login]
+url=https://www.jobs.nhs.uk/candidate/search
+email=your-email@example.com
+pwd=your-password
+
+[Search]
+url=https://www.jobs.nhs.uk/candidate/search/results?keyword=physiotherapist&payBand=BAND_5&skipPhraseSuggester=true&searchFormType=sortBy&sort=publicationDateDesc&language=en
+keyword=physiotherapist
+exclude=respiratory
+
+[LLM]
+provider=kimi.ai
+api_key=your-api-key-here
+model=moonshot-v1-8k

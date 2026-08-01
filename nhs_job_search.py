@@ -123,6 +123,91 @@ def contains_excluded_term(text: str, exclude_terms: list) -> bool:
     return any(term in lowered for term in exclude_terms)
 
 
+# ---------------------------------------------------------------------------
+# LLM summarisation
+# ---------------------------------------------------------------------------
+LLM_PROMPTS = {
+    "advert": (
+        "You are summarising an NHS job advert for a rotational Band 5 physiotherapist post. "
+        "Extract the key points relevant to an applicant: main duties, essential requirements, "
+        "desirable criteria, qualifications, professional registration, salary/band, working pattern, "
+        "location, and any special mentions. Return concise bullet points, one per line, "
+        "starting with '- '."
+    ),
+    "document": (
+        "You are summarising a supporting document for an NHS job advert. "
+        "Extract key information relevant to a Band 5 physiotherapist applicant: job summary, "
+        "main duties, person specification, essential and desirable criteria, qualifications, "
+        "skills, experience, and working conditions. Return concise bullet points, one per line, "
+        "starting with '- '."
+    ),
+    "trust": (
+        "You are reading the About Us / Values / Mission page of an NHS trust website. "
+        "Summarise the trust's stated values, mission, vision, culture, and what they emphasise "
+        "about patient care and staff. Return concise bullet points, one per line, starting with '- '."
+    ),
+}
+
+
+class LLMSummarizer:
+    """Simple OpenAI-compatible chat-completion summariser."""
+
+    def __init__(self, provider: str, api_key: str, model: str):
+        self.provider = (provider or "").lower().strip()
+        self.api_key = api_key
+        self.model = model
+        self.base_url = self._base_url()
+
+    def _base_url(self) -> str:
+        if self.provider in ("kimi", "kimi.ai", "moonshot"):
+            return "https://api.moonshot.ai/v1"
+        if self.provider in ("openai",):
+            return "https://api.openai.com/v1"
+        # Allow a custom base URL to be passed as the provider if it looks like one.
+        if self.provider.startswith(("http://", "https://")):
+            return self.provider.rstrip("/")
+        return ""
+
+    def is_configured(self) -> bool:
+        return bool(self.api_key and self.base_url and self.model)
+
+    def summarize(self, text: str, prompt_key: str, max_tokens: int = 1200) -> str:
+        if not self.is_configured() or not text:
+            return ""
+        prompt = LLM_PROMPTS.get(prompt_key, LLM_PROMPTS["document"])
+        truncated = self._truncate_text(text)
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant that summarises text accurately."},
+            {"role": "user", "content": f"{prompt}\n\n---\n\n{truncated}"},
+        ]
+        try:
+            resp = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": 0.2,
+                    "max_tokens": max_tokens,
+                },
+                timeout=60,
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            return content.strip()
+        except Exception as exc:
+            print(f"LLM summarisation failed ({self.provider}): {exc}", file=sys.stderr)
+            return ""
+
+    def _truncate_text(self, text: str, max_chars: int = 6000) -> str:
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + "\n\n[Content truncated due to length limits.]"
+
+
 def load_seen_references(path: Path) -> dict:
     """
     Load previously processed job references as a dict.
@@ -519,13 +604,14 @@ class NHSJobsClient:
         resp = self._post(job_url, data=payload, headers=headers, allow_redirects=True)
         return resp.content
 
-    def fetch_trust_website_summary(self, url: str) -> dict:
+    def fetch_trust_website_summary(self, url: str, llm: Optional[LLMSummarizer] = None) -> dict:
         """
         Fetch the trust's public website and extract a short summary.
 
         Tries to locate an About Us / Values / Mission page from the homepage
         navigation and summarises that page; falls back to the homepage if no
-        suitable page is found.
+        suitable page is found. If an LLM summariser is supplied it is used to
+        produce the summary, otherwise the legacy extractive summariser is used.
 
         Returns a dict with keys: url, title, summary, error.
         """
@@ -588,7 +674,11 @@ class NHSJobsClient:
                     if text:
                         result["url"] = best_link
                         result["title"] = clean_text(inner_soup.title.string) if inner_soup.title else result["title"]
-                        result["summary"] = summarise_trust_text(text)
+                        result["summary"] = (
+                            llm.summarize(text, "trust")
+                            if llm and llm.is_configured()
+                            else summarise_trust_text(text)
+                        )
                         return result
                 except Exception as inner_exc:
                     # Fall back to homepage summary.
@@ -597,7 +687,11 @@ class NHSJobsClient:
             # Fallback: summarise the homepage.
             text = extract_page_text(soup)
             if text:
-                result["summary"] = summarise_trust_text(text)
+                result["summary"] = (
+                    llm.summarize(text, "trust")
+                    if llm and llm.is_configured()
+                    else summarise_trust_text(text)
+                )
             else:
                 result["error"] = "Could not find page content."
         except Exception as exc:
@@ -791,7 +885,8 @@ def write_html_report(jobs: list, keyword: str, output_path: Path) -> None:
         body_lines.append("</div>")
 
         body_lines.append("<h3>Key points from the advert</h3>")
-        page_summary = summarise_text(job.get("details", {}).get("page_text", ""))
+        details = job.get("details", {})
+        page_summary = details.get("page_summary") or summarise_text(details.get("page_text", ""))
         body_lines.append(bullet_list(page_summary))
 
         docs = job.get("details", {}).get("documents", [])
@@ -800,8 +895,11 @@ def write_html_report(jobs: list, keyword: str, output_path: Path) -> None:
             for doc in docs:
                 filename = doc.get("filename", "Unknown")
                 body_lines.append(f'<h4>{html_escape(filename)}</h4>')
+                doc_summary = doc.get("summary")
                 doc_text = doc.get("text", "")
-                if doc_text:
+                if doc_summary:
+                    body_lines.append(bullet_list(doc_summary))
+                elif doc_text:
                     sections = extract_sections(doc_text)
                     if sections:
                         for heading, section_text in sections.items():
@@ -853,12 +951,22 @@ def load_config(path: Path) -> dict:
         "search_url": config.get("Search", "url", fallback=""),
         "search_keyword": config.get("Search", "keyword", fallback=""),
         "exclude_terms": config.get("Search", "exclude", fallback=""),
+        "llm_provider": config.get("LLM", "provider", fallback=""),
+        "llm_api_key": config.get("LLM", "api_key", fallback=""),
+        "llm_model": config.get("LLM", "model", fallback=""),
     }
 
 
 def main():
     cfg = load_config(CONFIG_PATH)
     client = NHSJobsClient()
+    llm = LLMSummarizer(
+        cfg.get("llm_provider", ""),
+        cfg.get("llm_api_key", ""),
+        cfg.get("llm_model", ""),
+    )
+    if llm.is_configured():
+        print(f"LLM summarisation enabled: {cfg.get('llm_provider')} / {cfg.get('llm_model')}")
 
     # Optional login (searching is public, so this is not required).
     if cfg.get("email") and cfg.get("password"):
@@ -941,11 +1049,17 @@ def main():
 
             job["details"] = details
 
+            # Generate an LLM summary of the advert page when configured.
+            page_text = details.get("page_text", "")
+            if page_text and llm.is_configured():
+                print("  Generating LLM summary of advert...")
+                details["page_summary"] = llm.summarize(page_text, "advert")
+
             # Fetch trust website summary if a URL is present.
             trust_url = details.get("employer_website", "")
             if trust_url:
                 print(f"  Fetching trust website: {trust_url}")
-                job["trust_summary"] = client.fetch_trust_website_summary(trust_url)
+                job["trust_summary"] = client.fetch_trust_website_summary(trust_url, llm=llm)
             else:
                 job["trust_summary"] = {"url": "", "title": "", "summary": "", "error": "No website listed."}
 
@@ -970,6 +1084,9 @@ def main():
                     doc_path.write_bytes(data)
                     doc["saved_path"] = str(doc_path.relative_to(BASE_DIR))
                     doc["text"] = extract_text_from_bytes(data, doc["filename"])
+                    if doc["text"] and llm.is_configured():
+                        print(f"  Generating LLM summary of {doc['filename']}...")
+                        doc["summary"] = llm.summarize(doc["text"], "document")
                 except Exception as exc:
                     doc["error"] = str(exc)
                     print(f"  Could not download document {doc.get('filename')}: {exc}", file=sys.stderr)
