@@ -2,15 +2,31 @@
 """
 NHS Jobs scraper.
 
-Searches NHS Jobs for "rotational band 5 physiotherapist", scrapes job
-listings, downloads supporting documents from each advert and writes a
-Markdown report summarising the key points.
+Searches NHS Jobs for configurable roles/bands, scrapes job listings,
+downloads supporting documents from each advert and writes an HTML report
+with LLM-generated summaries and trust-value notes.
 
 Configuration (credentials are only required if you want to log in):
     [Login]
     url=https://www.jobs.nhs.uk/candidate/search
     email=<your email>
     pwd=<your password>
+
+    [Search]
+    url=<NHS search results URL>
+    keyword=<search keyword>
+    exclude=<comma-separated terms to exclude from titles>
+
+    [Filters]
+    profession=<comma-separated profession keywords>
+    bands=<comma-separated band numbers>
+    required_terms=<comma-separated terms required in the advert>
+    exclude_bands=<comma-separated band numbers to reject>
+
+    [LLM]
+    provider=<kimi.ai | openai | base URL>
+    api_key=<your API key>
+    model=<model name>
 """
 
 import configparser
@@ -97,60 +113,79 @@ def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def is_rotational(text: str) -> bool:
-    """Return True if the text suggests this is a rotational post."""
-    return bool(text) and "rotational" in text.lower()
-
-
-def parse_exclude_terms(terms: str) -> list:
-    """Parse a comma-separated exclusion list into normalised tokens."""
+def parse_terms(terms: str) -> list:
+    """Parse a comma-separated list into normalised tokens."""
     if not terms:
         return []
     return [t.strip().lower() for t in terms.split(",") if t.strip()]
 
 
-def contains_excluded_term(text: str, exclude_terms: list) -> bool:
-    """Return True if text contains any of the excluded terms."""
-    if not text or not exclude_terms:
+def parse_band_numbers(bands: str) -> list:
+    """Parse a comma-separated list of band numbers into strings."""
+    if not bands:
+        return []
+    return [b.strip() for b in bands.split(",") if b.strip()]
+
+
+def text_matches_term(text: str, terms: list) -> bool:
+    """Return True if text contains any of the given terms."""
+    if not text or not terms:
         return False
     lowered = text.lower()
-    return any(term in lowered for term in exclude_terms)
+    return any(term in lowered for term in terms)
+
+
+def text_mentions_band(text: str, bands: list) -> bool:
+    """Return True if text mentions any of the given band numbers."""
+    if not text or not bands:
+        return False
+    lowered = text.lower()
+    return any(f"band {b}" in lowered or f"band{b}" in lowered for b in bands)
 
 
 # ---------------------------------------------------------------------------
 # LLM summarisation
 # ---------------------------------------------------------------------------
-LLM_PROMPTS = {
-    "advert": (
-        "You are summarising an NHS job advert for a rotational Band 5 physiotherapist post. "
-        "Extract the key points relevant to an applicant: main duties, essential requirements, "
-        "desirable criteria, qualifications, professional registration, salary/band, working pattern, "
-        "location, and any special mentions. Return concise bullet points, one per line, "
-        "starting with '- '."
-    ),
-    "document": (
-        "You are summarising a supporting document for an NHS job advert. "
-        "Extract key information relevant to a Band 5 physiotherapist applicant: job summary, "
-        "main duties, person specification, essential and desirable criteria, qualifications, "
-        "skills, experience, and working conditions. Return concise bullet points, one per line, "
-        "starting with '- '."
-    ),
-    "trust": (
-        "You are reading the About Us / Values / Mission page of an NHS trust website. "
-        "Summarise the trust's stated values, mission, vision, culture, and what they emphasise "
-        "about patient care and staff. Return concise bullet points, one per line, starting with '- '."
-    ),
-}
+def build_llm_prompts(filters: dict) -> dict:
+    """Build summarisation prompts tailored to the configured job filters."""
+    profession = ", ".join(filters.get("profession_terms", ["the advertised profession"]))
+    bands = ", ".join(filters.get("include_bands", ["the advertised band"]))
+    required = ", ".join(filters.get("required_terms", []))
+    role_desc = f"Band {bands} {profession} post"
+    if required:
+        role_desc += f" with focus on: {required}"
+
+    return {
+        "advert": (
+            f"You are summarising an NHS job advert for a {role_desc}. "
+            "Extract the key points relevant to an applicant: main duties, essential requirements, "
+            "desirable criteria, qualifications, professional registration, salary/band, working pattern, "
+            "location, and any special mentions. Return concise bullet points, one per line, "
+            "starting with '- '."
+        ),
+        "document": (
+            f"You are summarising a supporting document for an NHS job advert for a {role_desc}. "
+            "Extract key information relevant to an applicant: job summary, main duties, person specification, "
+            "essential and desirable criteria, qualifications, skills, experience, and working conditions. "
+            "Return concise bullet points, one per line, starting with '- '."
+        ),
+        "trust": (
+            "You are reading the About Us / Values / Mission page of an NHS trust website. "
+            "Summarise the trust's stated values, mission, vision, culture, and what they emphasise "
+            "about patient care and staff. Return concise bullet points, one per line, starting with '- '."
+        ),
+    }
 
 
 class LLMSummarizer:
     """Simple OpenAI-compatible chat-completion summariser."""
 
-    def __init__(self, provider: str, api_key: str, model: str):
+    def __init__(self, provider: str, api_key: str, model: str, prompts: dict = None):
         self.provider = (provider or "").lower().strip()
         self.api_key = api_key
         self.model = model
         self.base_url = self._base_url()
+        self.prompts = prompts or build_llm_prompts({})
 
     def _base_url(self) -> str:
         if self.provider in ("kimi", "kimi.ai", "moonshot"):
@@ -168,7 +203,7 @@ class LLMSummarizer:
     def summarize(self, text: str, prompt_key: str, max_tokens: int = 1200) -> str:
         if not self.is_configured() or not text:
             return ""
-        prompt = LLM_PROMPTS.get(prompt_key, LLM_PROMPTS["document"])
+        prompt = self.prompts.get(prompt_key, self.prompts["document"])
         truncated = self._truncate_text(text)
         messages = [
             {"role": "system", "content": "You are a helpful assistant that summarises text accurately."},
@@ -249,30 +284,6 @@ def load_existing_jobs(path: Path) -> list:
     except Exception:
         pass
     return []
-
-
-def is_physiotherapy(text: str) -> bool:
-    """Return True if the text relates to physiotherapy."""
-    if not text:
-        return False
-    lowered = text.lower()
-    return "physiotherapist" in lowered or "physiotherapy" in lowered or "physio" in lowered
-
-
-def is_band_5(text: str) -> bool:
-    """Return True if the text clearly indicates a Band 5 post."""
-    if not text:
-        return False
-    lowered = text.lower()
-    return "band 5" in lowered or "band5" in lowered
-
-
-def is_unwanted_band(text: str) -> bool:
-    """Return True if the text mentions a higher band that would exclude Band 5."""
-    if not text:
-        return False
-    lowered = text.lower()
-    return any(f"band {b}" in lowered for b in (6, 7, 8, 9)) or "band 6" in lowered
 
 
 def parse_document_filename(value: str) -> str:
@@ -367,15 +378,16 @@ class NHSJobsClient:
         search_url: str = "",
         max_candidates: int = 50,
         max_pages: int = 20,
+        profession_terms: list = None,
+        exclude_bands: list = None,
     ) -> list:
         """
         Search NHS Jobs and return candidate job dictionaries.
 
         If `search_url` is supplied it is used as the base query URL and its
         query parameters are preserved while paging. Otherwise a default URL
-        is built from `keyword` plus Band 5 / Allied Health Professionals
-        filters. The caller is expected to fetch details and apply stricter
-        text filters.
+        is built from `keyword`. The caller is expected to fetch details and
+        apply stricter text filters.
         """
         candidates = []
         page = 1
@@ -393,8 +405,6 @@ class NHSJobsClient:
                 "keyword": keyword,
                 "language": "en",
                 "searchFormType": "main",
-                "payBand": "BAND_5",
-                "staffGroup": "ALLIED_HEALTH_PROF",
             }
 
         while len(candidates) < max_candidates and page <= max_pages:
@@ -418,10 +428,11 @@ class NHSJobsClient:
                 job = self._parse_search_result(item)
                 if not job:
                     continue
-                # The NHS keyword search matches many therapist roles; keep
-                # only physiotherapy-related Band 5 titles as candidates.
+                # Light pre-filter using configured profession/band rules.
                 title = job.get("title", "")
-                if is_physiotherapy(title) and not is_unwanted_band(title):
+                profession_ok = not profession_terms or text_matches_term(title, profession_terms)
+                band_ok = not exclude_bands or not text_mentions_band(title, exclude_bands)
+                if profession_ok and band_ok:
                     candidates.append(job)
 
             # Stop if there is no "next" page link.
@@ -867,6 +878,10 @@ def load_config(path: Path) -> dict:
         "search_url": config.get("Search", "url", fallback=""),
         "search_keyword": config.get("Search", "keyword", fallback=""),
         "exclude_terms": config.get("Search", "exclude", fallback=""),
+        "profession_terms": parse_terms(config.get("Filters", "profession", fallback="physiotherapist, physiotherapy, physio")),
+        "include_bands": parse_band_numbers(config.get("Filters", "bands", fallback="5")),
+        "required_terms": parse_terms(config.get("Filters", "required_terms", fallback="rotational")),
+        "exclude_bands": parse_band_numbers(config.get("Filters", "exclude_bands", fallback="6,7,8,9")),
         "llm_provider": config.get("LLM", "provider", fallback=""),
         "llm_api_key": config.get("LLM", "api_key", fallback=""),
         "llm_model": config.get("LLM", "model", fallback=""),
@@ -879,10 +894,12 @@ def main():
 
     cfg = load_config(CONFIG_PATH)
     client = NHSJobsClient()
+    llm_prompts = build_llm_prompts(cfg)
     llm = LLMSummarizer(
         cfg.get("llm_provider", ""),
         cfg.get("llm_api_key", ""),
         cfg.get("llm_model", ""),
+        prompts=llm_prompts,
     )
     if not llm.is_configured():
         print(
@@ -903,21 +920,32 @@ def main():
 
     keyword = cfg.get("search_keyword") or os.environ.get("SEARCH_KEYWORD") or "rotational physiotherapist"
     search_url = cfg.get("search_url") or os.environ.get("SEARCH_URL") or ""
-    exclude_terms = parse_exclude_terms(
+    exclude_terms = parse_terms(
         cfg.get("exclude_terms") or os.environ.get("EXCLUDE_TERMS") or ""
     )
+    profession_terms = cfg.get("profession_terms") or []
+    include_bands = cfg.get("include_bands") or []
+    required_terms = cfg.get("required_terms") or []
+    exclude_bands = cfg.get("exclude_bands") or []
     max_jobs = int(os.environ.get("MAX_JOBS", "10"))
     max_candidates = int(os.environ.get("MAX_CANDIDATES", "50"))
 
     display_term = keyword if not search_url else (search_url.split("?", 1)[0] if "?" in search_url else search_url)
     print(f"Searching for: {display_term} (keyword filter: {keyword})")
+    print(f"Profession filters: {', '.join(profession_terms)}")
+    print(f"Band filters: {', '.join(include_bands)}")
+    print(f"Required terms: {', '.join(required_terms)}")
     if exclude_terms:
         print(f"Excluding adverts containing: {', '.join(exclude_terms)}")
+    if exclude_bands:
+        print(f"Excluding bands: {', '.join(exclude_bands)}")
 
     candidates = client.search_jobs(
         keyword,
         search_url=search_url,
         max_candidates=max_candidates,
+        profession_terms=profession_terms,
+        exclude_bands=exclude_bands,
     )
     print(f"Found {len(candidates)} candidate jobs; checking details...")
 
@@ -953,23 +981,23 @@ def main():
             details = client.fetch_job_details(job["url"])
             combined_text = f"{job.get('title', '')} {details.get('page_text', '')}"
 
-            # Strict filters to ensure we only report rotational Band 5 physiotherapy posts.
-            if not is_physiotherapy(combined_text):
-                print(f"  Skipping {job['reference']}: not physiotherapy-related.")
+            # Apply configured filters to the combined job text.
+            if profession_terms and not text_matches_term(combined_text, profession_terms):
+                print(f"  Skipping {job['reference']}: does not match profession filters.")
                 continue
-            if not is_band_5(combined_text):
-                print(f"  Skipping {job['reference']}: not Band 5.")
+            if include_bands and not text_mentions_band(combined_text, include_bands):
+                print(f"  Skipping {job['reference']}: does not match band filters.")
                 continue
-            if is_unwanted_band(combined_text):
-                print(f"  Skipping {job['reference']}: mentions a higher band.")
+            if exclude_bands and text_mentions_band(combined_text, exclude_bands):
+                print(f"  Skipping {job['reference']}: mentions an excluded band.")
                 continue
-            if not is_rotational(combined_text):
-                print(f"  Skipping {job['reference']}: not rotational.")
+            if required_terms and not text_matches_term(combined_text, required_terms):
+                print(f"  Skipping {job['reference']}: missing required terms.")
                 continue
             # Exclusion terms are matched against the job title so that general
-            # rotational posts which merely mention an excluded specialty in the
-            # body text are not removed.
-            if contains_excluded_term(job.get("title", ""), exclude_terms):
+            # posts which merely mention an excluded specialty in the body text
+            # are not removed.
+            if text_matches_term(job.get("title", ""), exclude_terms):
                 matched = [t for t in exclude_terms if t in job.get("title", "").lower()]
                 print(f"  Skipping {job['reference']}: excluded term(s) in title: {', '.join(matched)}.")
                 continue

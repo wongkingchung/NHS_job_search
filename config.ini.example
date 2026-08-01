@@ -8,6 +8,16 @@ url=https://www.jobs.nhs.uk/candidate/search/results?keyword=physiotherapist&pay
 keyword=physiotherapist
 exclude=respiratory
 
+[Filters]
+# Comma-separated keywords that must appear in the job text (e.g., profession).
+profession=physiotherapist, physiotherapy, physio
+# Comma-separated band numbers to accept.
+bands=5
+# Comma-separated terms that must also appear (e.g., rotational).
+required_terms=rotational
+# Comma-separated band numbers to reject (e.g., when a higher band is mentioned).
+exclude_bands=6,7,8,9
+
 [LLM]
 provider=kimi.ai
 api_key=your-api-key-here
