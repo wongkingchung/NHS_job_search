@@ -89,55 +89,12 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
-# Keywords used to highlight the most relevant sentences when summarising.
-KEY_PHRASES = [
-    "essential", "desirable", "requirement", "qualification", "degree",
-    "registered", "hcpc", "csp", "experience", "skill", "knowledge",
-    "ability", "responsibility", "duty", "main duties", "job summary",
-    "person specification", "band 5", "rotational", "physiotherapist",
-    "assessment", "treatment", "rehabilitation", "multidisciplinary",
-    "communication", "team", "patient", "clinical", "caseload",
-    "mentorship", "supervision", "appraisal", "training", "development",
-]
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def clean_text(text: str) -> str:
     """Normalise whitespace in a string."""
     return re.sub(r"\s+", " ", text).strip()
-
-
-def score_sentence(sentence: str) -> int:
-    """Score a sentence by how many key job-related words it contains."""
-    lowered = sentence.lower()
-    return sum(1 for phrase in KEY_PHRASES if phrase in lowered)
-
-
-def summarise_text(text: str, max_sentences: int = 12) -> str:
-    """
-    Simple extractive summary.
-
-    Splits the text into sentences, scores each sentence by the presence of
-    job-relevant keywords, and returns the top scoring sentences in their
-    original order.
-    """
-    if not text:
-        return "No text available to summarise."
-
-    # Split on sentence endings while keeping the delimiters.
-    raw_sentences = re.split(r"(?<=[.!?])\s+", text.replace("\n", " "))
-    sentences = [clean_text(s) for s in raw_sentences if len(s.split()) > 4]
-
-    if not sentences:
-        return clean_text(text)[:1000]
-
-    scored = [(i, score_sentence(s), s) for i, s in enumerate(sentences)]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    top = scored[:max_sentences]
-    top.sort(key=lambda x: x[0])  # restore original order
-    return "\n".join(f"- {s}" for _, _, s in top)
 
 
 def is_rotational(text: str) -> bool:
@@ -341,41 +298,6 @@ def parse_document_filename(value: str) -> str:
 
     ext = inferred_ext or "bin"
     return f"{value}.{ext}"
-
-
-def extract_sections(text: str) -> dict:
-    """
-    Try to split a document into common NHS job-description sections.
-    Returns a dict of section heading -> paragraph text.
-    """
-    section_names = [
-        "job summary", "main duties", "responsibilities", "person specification",
-        "education", "qualifications", "skills", "knowledge", "abilities",
-        "experience", "disclosure", "registration",
-    ]
-
-    # Heuristic: look for lines that look like section headings.
-    pattern = re.compile(
-        r"(?:\n|\r|^)\s*(" + "|".join(re.escape(s) for s in section_names) + r")",
-        re.IGNORECASE,
-    )
-    parts = pattern.split(text)
-    sections = {}
-    current_heading = "Overview"
-    for part in parts:
-        if part is None:
-            continue
-        if re.match(
-            r"(?:" + "|".join(re.escape(s) for s in section_names) + r")",
-            part,
-            re.IGNORECASE,
-        ):
-            current_heading = part.strip().title()
-            sections.setdefault(current_heading, [])
-        else:
-            sections.setdefault(current_heading, []).append(part.strip())
-
-    return {k: clean_text("\n".join(v)) for k, v in sections.items() if v}
 
 
 # ---------------------------------------------------------------------------
@@ -711,11 +633,7 @@ class NHSJobsClient:
                     if text:
                         result["url"] = best_link
                         result["title"] = clean_text(inner_soup.title.string) if inner_soup.title else result["title"]
-                        result["summary"] = (
-                            llm.summarize(text, "trust")
-                            if llm and llm.is_configured()
-                            else summarise_trust_text(text)
-                        )
+                        result["summary"] = llm.summarize(text, "trust")
                         return result
                 except Exception as inner_exc:
                     # Fall back to homepage summary.
@@ -724,49 +642,13 @@ class NHSJobsClient:
             # Fallback: summarise the homepage.
             text = extract_page_text(soup)
             if text:
-                result["summary"] = (
-                    llm.summarize(text, "trust")
-                    if llm and llm.is_configured()
-                    else summarise_trust_text(text)
-                )
+                result["summary"] = llm.summarize(text, "trust")
             else:
                 result["error"] = "Could not find page content."
         except Exception as exc:
             result["error"] = str(exc)
 
         return result
-
-
-# ---------------------------------------------------------------------------
-# Trust website summarisation
-# ---------------------------------------------------------------------------
-TRUST_KEY_PHRASES = [
-    "trust", "hospital", "nhs", "care", "patients", "values", "mission",
-    "vision", "about us", "our services", "excellence", "compassion",
-    "respect", "dignity", "commitment", "quality", "safety", "wellbeing",
-    "staff", "team", "award", "foundation trust", "healthcare", "community",
-    "partnership", "innovation", "improvement", "integrity", "accountability",
-    "kindness", "patient centred", "person centred", "our purpose",
-]
-
-
-def summarise_trust_text(text: str, max_sentences: int = 8) -> str:
-    """Extractive summary focused on trust identity, values and services."""
-    if not text:
-        return "No content available."
-
-    raw_sentences = re.split(r"(?<=[.!?])\s+", text.replace("\n", " "))
-    sentences = [clean_text(s) for s in raw_sentences if len(s.split()) > 5]
-
-    def score(sentence: str) -> int:
-        lowered = sentence.lower()
-        return sum(1 for phrase in TRUST_KEY_PHRASES if phrase in lowered)
-
-    scored = [(i, score(s), s) for i, s in enumerate(sentences)]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    top = scored[:max_sentences]
-    top.sort(key=lambda x: x[0])
-    return "\n".join(f"- {s}" for _, _, s in top)
 
 
 # ---------------------------------------------------------------------------
@@ -923,8 +805,13 @@ def write_html_report(jobs: list, keyword: str, output_path: Path) -> None:
 
         body_lines.append("<h3>Key points from the advert</h3>")
         details = job.get("details", {})
-        page_summary = details.get("page_summary") or summarise_text(details.get("page_text", ""))
-        body_lines.append(bullet_list(page_summary))
+        page_summary = details.get("page_summary")
+        if page_summary:
+            body_lines.append(bullet_list(page_summary))
+        elif details.get("page_text"):
+            body_lines.append("<p><em>Advert text extracted but LLM summary is not available.</em></p>")
+        else:
+            body_lines.append("<p><em>No advert text available.</em></p>")
 
         docs = job.get("details", {}).get("documents", [])
         body_lines.append("<h3>Supporting documents</h3>")
@@ -933,18 +820,10 @@ def write_html_report(jobs: list, keyword: str, output_path: Path) -> None:
                 filename = doc.get("filename", "Unknown")
                 body_lines.append(f'<h4>{html_escape(filename)}</h4>')
                 doc_summary = doc.get("summary")
-                doc_text = doc.get("text", "")
                 if doc_summary:
                     body_lines.append(bullet_list(doc_summary))
-                elif doc_text:
-                    sections = extract_sections(doc_text)
-                    if sections:
-                        for heading, section_text in sections.items():
-                            if section_text:
-                                body_lines.append(f'<div class="section-heading">{html_escape(heading)}</div>')
-                                body_lines.append(bullet_list(summarise_text(section_text, max_sentences=8)))
-                    else:
-                        body_lines.append(bullet_list(summarise_text(doc_text, max_sentences=10)))
+                elif doc.get("text"):
+                    body_lines.append("<p><em>Document text extracted but LLM summary is not available.</em></p>")
                 else:
                     body_lines.append("<p><em>No text could be extracted from this document.</em></p>")
         else:
@@ -1005,8 +884,16 @@ def main():
         cfg.get("llm_api_key", ""),
         cfg.get("llm_model", ""),
     )
-    if llm.is_configured():
-        print(f"LLM summarisation enabled: {cfg.get('llm_provider')} / {cfg.get('llm_model')}")
+    if not llm.is_configured():
+        print(
+            "ERROR: LLM summarisation is required but no provider/API key/model is configured.\n"
+            "Please add an [LLM] section to config.ini (see config.ini.example). "
+            "Supported providers: kimi.ai / moonshot, openai, or any OpenAI-compatible base URL.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"LLM summarisation enabled: {cfg.get('llm_provider')} / {cfg.get('llm_model')}")
 
     # Optional login (searching is public, so this is not required).
     if cfg.get("email") and cfg.get("password"):
