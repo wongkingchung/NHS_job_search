@@ -7,12 +7,13 @@ A small Python scraper that searches [NHS Jobs](https://www.jobs.nhs.uk) for rot
 1. Reads `config.ini` for optional login credentials and search settings.
 2. Searches NHS Jobs using a configurable search URL (e.g., your filtered NHS Jobs link).
 3. Keeps only physiotherapy-related adverts and verifies each detail page mentions **Band 5** and **rotational**.
-4. Applies exclusion terms from config (e.g., skip jobs with "respiratory" in the title).
-5. Downloads supporting documents (PDF/DOC/DOCX) attached to each advert.
-6. Extracts text from the documents and the advert page.
-7. Visits each employer's listed website and summarises key trust information.
-8. Tracks processed job references so duplicates are skipped in future runs.
-9. Writes (report file includes the run date as `YYYYMMDD`):
+4. Keeps only adverts posted within the last 7 days (results are sorted newest-first via `sort=publicationDateDesc`).
+5. Applies exclusion terms from config (e.g., skip jobs with "respiratory" in the title).
+6. Downloads supporting documents (PDF/DOC/DOCX) attached to each advert.
+7. Extracts text from the documents and the advert page.
+8. Visits each employer's listed website and summarises key trust information.
+9. Tracks processed job references so duplicates are skipped in future runs.
+10. Writes (report file includes the run date as `YYYYMMDD`):
    - `output/jobs_report_YYYYMMDD.html` — styled HTML report; open in any browser.
    - `output/jobs_data.json` — cumulative structured data for all unique jobs.
    - `output/seen_references.json` — list of references already processed.
@@ -74,6 +75,13 @@ set MAX_CANDIDATES=100
 python nhs_job_search.py
 ```
 
+Control how fresh adverts must be (default: only jobs posted in the last 7 days are included):
+
+```bash
+set MAX_AGE_DAYS=14
+python nhs_job_search.py
+```
+
 Or override settings for one run:
 
 ```bash
@@ -85,8 +93,8 @@ python nhs_job_search.py
 
 ## Output
 
-- `output/jobs_report_YYYYMMDD.html` — the main report; double-click to open in your browser.
-- `output/jobs_data.json` — cumulative raw scraped data for all unique jobs seen so far.
+- `output/jobs_report_YYYYMMDD.html` — the main report; double-click to open in your browser. It lists only adverts posted within the date window (`MAX_AGE_DAYS`, default 7), sorted by date posted, newest first, and shows the date posted for each job.
+- `output/jobs_data.json` — cumulative raw scraped data for all unique jobs seen so far (includes jobs that have aged out of the report window).
 - `output/seen_references.json` — references already processed, with date scraped, job title, and trust name; used to skip duplicates.
 - `output/documents/` — downloaded files named by job reference.
 
@@ -94,7 +102,7 @@ python nhs_job_search.py
 
 - The scraper adds a 1-second delay between requests to be polite to the NHS Jobs and trust websites.
 - Legacy `.doc` files are extracted using Microsoft Word COM on Windows. If Word is not installed, those files are saved for manual review.
-- The filters applied are: title/page text must relate to physiotherapy, mention **Band 5**, and mention **rotational**. Adverts that mention higher bands (e.g., Band 6, 7) are excluded.
+- The filters applied are: title/page text must relate to physiotherapy, mention **Band 5**, and mention **rotational**. Adverts that mention higher bands (e.g., Band 6, 7) are excluded. Adverts must also have been posted within the last `MAX_AGE_DAYS` days (default 7), checked against the "Date posted" shown on the job page.
 - Exclusion terms are matched against the **job title** so that general rotational posts which mention an excluded specialty in the body text are not removed.
 - Trust website summaries are best-effort extracts from the employer's **About Us / Values / Vision** page (linked from the homepage), falling back to the homepage if no suitable page is found.
-- Reports and `jobs_data.json` are cumulative: each run adds only new, unique jobs and keeps all previously seen ones.
+- `jobs_data.json` is cumulative: each run adds only new, unique jobs and keeps all previously seen ones. The HTML report is **not** cumulative — it shows only jobs within the date window.

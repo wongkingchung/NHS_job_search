@@ -143,6 +143,19 @@ def text_mentions_band(text: str, bands: list) -> bool:
     return any(f"band {b}" in lowered or f"band{b}" in lowered for b in bands)
 
 
+def parse_posted_date(text: str) -> Optional[datetime.date]:
+    """Parse an NHS 'Date posted' string (e.g. '7 August 2026') into a date."""
+    if not text:
+        return None
+    cleaned = re.sub(r"(?i)^date\s*posted[:\s]*", "", text.strip())
+    for fmt in ("%d %B %Y", "%d/%m/%Y"):
+        try:
+            return datetime.datetime.strptime(cleaned, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
 # ---------------------------------------------------------------------------
 # LLM summarisation
 # ---------------------------------------------------------------------------
@@ -407,6 +420,10 @@ class NHSJobsClient:
                 "searchFormType": "main",
             }
 
+        # Newest adverts first so recent posts are collected before older
+        # ones when the candidate limit cuts the list short.
+        base_params.setdefault("sort", "publicationDateDesc")
+
         while len(candidates) < max_candidates and page <= max_pages:
             params = dict(base_params)
             params["page"] = page
@@ -500,12 +517,21 @@ class NHSJobsClient:
         details = {
             "page_text": "",
             "documents": [],
+            "date_posted": "",
         }
 
         # Main advert text is inside <main>.
         main = soup.find("main")
         if main:
             details["page_text"] = clean_text(main.get_text(" ", strip=True))
+
+        # "Date posted" on the job page is an <h3> heading followed by a <p>.
+        for h3 in soup.find_all("h3"):
+            if h3.get_text(strip=True).lower() == "date posted":
+                p = h3.find_next_sibling("p")
+                if p:
+                    details["date_posted"] = clean_text(p.get_text(" ", strip=True))
+                break
 
         # Structured fields from the Details panel.
         def detail_value(label: str) -> str:
@@ -726,7 +752,7 @@ def extract_text_from_bytes(data: bytes, filename: str) -> str:
 # ---------------------------------------------------------------------------
 # Report generation
 # ---------------------------------------------------------------------------
-def write_html_report(jobs: list, keyword: str, output_path: Path) -> None:
+def write_html_report(jobs: list, keyword: str, output_path: Path, posted_since: Optional[datetime.date] = None) -> None:
     """Generate a styled HTML report for browser reading."""
 
     def html_escape(text: str) -> str:
@@ -780,17 +806,22 @@ def write_html_report(jobs: list, keyword: str, output_path: Path) -> None:
         f'<p><strong>Search term:</strong> {html_escape(keyword)}</p>',
         f'<p><strong>Jobs found:</strong> {len(jobs)}</p>',
     ]
+    if posted_since:
+        body_lines.append(
+            f'<p><strong>Date filter:</strong> only adverts posted since {posted_since} are shown, newest first.</p>'
+        )
 
     # Table of contents with clickable links to each job detail.
     if jobs:
         body_lines.append("<h2>Job list</h2>")
-        body_lines.append('<table class="toc"><thead><tr><th>#</th><th>Job title</th><th>Trust</th><th>Closing date</th></tr></thead><tbody>')
+        body_lines.append('<table class="toc"><thead><tr><th>#</th><th>Job title</th><th>Trust</th><th>Date posted</th><th>Closing date</th></tr></thead><tbody>')
         for idx, job in enumerate(jobs, 1):
             body_lines.append(
                 f'<tr>'
                 f'<td>{idx}</td>'
                 f'<td><a href="#job-{idx}">{html_escape(job.get("title", ""))}</a></td>'
                 f'<td>{html_escape(job.get("employer", ""))}</td>'
+                f'<td>{html_escape(job.get("date_posted", ""))}</td>'
                 f'<td>{html_escape(job.get("closing_date", ""))}</td>'
                 f'</tr>'
             )
@@ -808,6 +839,7 @@ def write_html_report(jobs: list, keyword: str, output_path: Path) -> None:
         body_lines.append(f'<li><strong>Salary:</strong> {html_escape(job.get("salary", ""))}</li>')
         body_lines.append(f'<li><strong>Contract type:</strong> {html_escape(job.get("contract_type", ""))}</li>')
         body_lines.append(f'<li><strong>Working pattern:</strong> {html_escape(job.get("working_pattern", ""))}</li>')
+        body_lines.append(f'<li><strong>Date posted:</strong> {html_escape(job.get("date_posted", ""))}</li>')
         body_lines.append(f'<li><strong>Closing date:</strong> {html_escape(job.get("closing_date", ""))}</li>')
         advert_url = job.get("url", "")
         body_lines.append(f'<li><strong>Advert URL:</strong> <a href="{html_escape(advert_url)}" target="_blank">{html_escape(advert_url)}</a></li>')
@@ -929,6 +961,10 @@ def main():
     exclude_bands = cfg.get("exclude_bands") or []
     max_jobs = int(os.environ.get("MAX_JOBS", "10"))
     max_candidates = int(os.environ.get("MAX_CANDIDATES", "50"))
+    max_age_days = int(os.environ.get("MAX_AGE_DAYS", "7"))
+    today = datetime.date.today()
+    # Only include adverts posted within the last MAX_AGE_DAYS days (inclusive).
+    posted_cutoff = today - datetime.timedelta(days=max_age_days)
 
     display_term = keyword if not search_url else (search_url.split("?", 1)[0] if "?" in search_url else search_url)
     print(f"Searching for: {display_term} (keyword filter: {keyword})")
@@ -939,6 +975,7 @@ def main():
         print(f"Excluding adverts containing: {', '.join(exclude_terms)}")
     if exclude_bands:
         print(f"Excluding bands: {', '.join(exclude_bands)}")
+    print(f"Date filter: only adverts posted in the last {max_age_days} day(s) (since {posted_cutoff})")
 
     candidates = client.search_jobs(
         keyword,
@@ -976,9 +1013,21 @@ def main():
         if ref and ref in seen_refs:
             print(f"[{i}/{len(candidates)}] Skipping {ref} - already processed.")
             continue
+        # Cheap age check using the search-result date before fetching details.
+        posted = parse_posted_date(job.get("date_posted", ""))
+        if posted and posted < posted_cutoff:
+            print(f"[{i}/{len(candidates)}] Skipping {ref} - posted {job.get('date_posted')} is older than {max_age_days} day(s).")
+            continue
         print(f"[{i}/{len(candidates)}] Processing {ref} - {job['title']}")
         try:
             details = client.fetch_job_details(job["url"])
+            # The job page carries the authoritative "Date posted".
+            if details.get("date_posted"):
+                job["date_posted"] = details["date_posted"]
+            posted = parse_posted_date(job.get("date_posted", ""))
+            if posted and posted < posted_cutoff:
+                print(f"  Skipping {job['reference']}: posted {job.get('date_posted')} is older than {max_age_days} day(s).")
+                continue
             combined_text = f"{job.get('title', '')} {details.get('page_text', '')}"
 
             # Apply configured filters to the combined job text.
@@ -1054,22 +1103,34 @@ def main():
     # Persist references so future runs skip duplicates.
     save_seen_references(SEEN_REFS_PATH, seen_refs)
 
-    # Merge new jobs into existing data so reports are cumulative.
+    # Merge new jobs into existing data so the stored data stays cumulative.
     for job in jobs:
         ref = job.get("reference", "")
         if ref:
             existing_jobs[ref] = job
     all_jobs = list(existing_jobs.values())
 
-    # Save structured data.
+    # Save structured data (cumulative: all unique jobs ever scraped).
     JSON_PATH.write_text(json.dumps(all_jobs, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    # Save HTML report with YYYYMMDD suffix for easy reference.
-    today = datetime.datetime.now().strftime("%Y%m%d")
-    html_report_path = OUTPUT_DIR / f"jobs_report_{today}.html"
-    write_html_report(all_jobs, keyword, html_report_path)
+    # The report only shows adverts posted within the date window, newest
+    # first. Jobs with an unparseable date are kept rather than dropped.
+    report_jobs = [
+        j for j in all_jobs
+        if not parse_posted_date(j.get("date_posted", ""))
+        or parse_posted_date(j.get("date_posted", "")) >= posted_cutoff
+    ]
+    report_jobs.sort(
+        key=lambda j: parse_posted_date(j.get("date_posted", "")) or datetime.date.min,
+        reverse=True,
+    )
 
-    print(f"\nDone. Cumulative unique jobs in report: {len(all_jobs)}")
+    # Save HTML report with YYYYMMDD suffix for easy reference.
+    today_stamp = datetime.datetime.now().strftime("%Y%m%d")
+    html_report_path = OUTPUT_DIR / f"jobs_report_{today_stamp}.html"
+    write_html_report(report_jobs, keyword, html_report_path, posted_since=posted_cutoff)
+
+    print(f"\nDone. Jobs in report (posted since {posted_cutoff}): {len(report_jobs)}; cumulative unique jobs stored: {len(all_jobs)}")
     print(f"HTML report: {html_report_path}")
     print(f"Raw data:        {JSON_PATH}")
     print(f"Documents:       {DOCS_DIR}")
