@@ -222,26 +222,51 @@ class LLMSummarizer:
             {"role": "system", "content": "You are a helpful assistant that summarises text accurately."},
             {"role": "user", "content": f"{prompt}\n\n---\n\n{truncated}"},
         ]
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        # Moonshot's thinking models can burn the entire max_tokens budget on
+        # reasoning and return empty content; summarisation does not need it.
+        # K3 refuses to disable thinking, so fall back if the request is rejected.
+        if self.provider in ("kimi", "kimi.ai", "moonshot"):
+            payload["thinking"] = {"type": "disabled"}
         try:
-            resp = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "max_tokens": max_tokens,
-                },
-                timeout=60,
-            )
+            resp = self._post(payload)
             resp.raise_for_status()
+        except requests.HTTPError as exc:
+            if "thinking" in payload and exc.response is not None and exc.response.status_code == 400:
+                payload.pop("thinking")
+                try:
+                    resp = self._post(payload)
+                    resp.raise_for_status()
+                except Exception as exc2:
+                    print(f"LLM summarisation failed ({self.provider}): {exc2}", file=sys.stderr)
+                    return ""
+            else:
+                print(f"LLM summarisation failed ({self.provider}): {exc}", file=sys.stderr)
+                return ""
+        except Exception as exc:
+            print(f"LLM summarisation failed ({self.provider}): {exc}", file=sys.stderr)
+            return ""
+        try:
             content = resp.json()["choices"][0]["message"]["content"]
             return content.strip()
         except Exception as exc:
             print(f"LLM summarisation failed ({self.provider}): {exc}", file=sys.stderr)
             return ""
+
+    def _post(self, payload: dict) -> requests.Response:
+        return requests.post(
+            f"{self.base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=60,
+        )
 
     def _truncate_text(self, text: str, max_chars: int = 6000) -> str:
         if len(text) <= max_chars:
