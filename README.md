@@ -75,7 +75,7 @@ set MAX_CANDIDATES=100
 python nhs_job_search.py
 ```
 
-Control how fresh adverts must be (default: only jobs posted in the last 7 days are included):
+Control how fresh adverts must be. Set `max_age_days` under `[Filters]` in `config.ini` (default 7), or override for one run:
 
 ```bash
 set MAX_AGE_DAYS=14
@@ -93,7 +93,7 @@ python nhs_job_search.py
 
 ## Output
 
-- `output/jobs_report_YYYYMMDD.html` — the main report; double-click to open in your browser. It lists only adverts posted within the date window (`MAX_AGE_DAYS`, default 7), sorted by date posted, newest first, and shows the date posted for each job.
+- `output/jobs_report_YYYYMMDD.html` — the main report; double-click to open in your browser. It lists only adverts posted within the date window (`max_age_days` in `config.ini`, default 7; env var `MAX_AGE_DAYS` overrides), sorted by date posted, newest first, and shows the date posted for each job.
 - `output/jobs_data.json` — cumulative raw scraped data for all unique jobs seen so far (includes jobs that have aged out of the report window).
 - `output/seen_references.json` — references already processed, with date scraped, job title, and trust name; used to skip duplicates.
 - `output/documents/` — downloaded files named by job reference.
@@ -102,7 +102,7 @@ python nhs_job_search.py
 
 - The scraper adds a 1-second delay between requests to be polite to the NHS Jobs and trust websites.
 - Legacy `.doc` files are extracted using Microsoft Word COM on Windows. If Word is not installed, those files are saved for manual review.
-- The filters applied are: title/page text must relate to physiotherapy, mention **Band 5**, and mention **rotational**. Adverts that mention higher bands (e.g., Band 6, 7) are excluded. Adverts must also have been posted within the last `MAX_AGE_DAYS` days (default 7), checked against the "Date posted" shown on the job page.
+- The filters applied are: title/page text must relate to physiotherapy, mention **Band 5**, and mention **rotational**. Adverts that mention higher bands (e.g., Band 6, 7) are excluded. Adverts must also have been posted within the last `max_age_days` days (default 7, set under `[Filters]` in `config.ini`; env var `MAX_AGE_DAYS` overrides), checked against the "Date posted" shown on the job page.
 - Exclusion terms are matched against the **job title** so that general rotational posts which mention an excluded specialty in the body text are not removed.
 - Trust website summaries are best-effort extracts from the employer's **About Us / Values / Vision** page (linked from the homepage), falling back to the homepage if no suitable page is found.
 - `jobs_data.json` is cumulative: each run adds only new, unique jobs and keeps all previously seen ones. The HTML report is **not** cumulative — it shows only jobs within the date window.

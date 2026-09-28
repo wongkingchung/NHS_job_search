@@ -232,7 +232,6 @@ class LLMSummarizer:
                 json={
                     "model": self.model,
                     "messages": messages,
-                    "temperature": 0.2,
                     "max_tokens": max_tokens,
                 },
                 timeout=60,
@@ -914,6 +913,7 @@ def load_config(path: Path) -> dict:
         "include_bands": parse_band_numbers(config.get("Filters", "bands", fallback="5")),
         "required_terms": parse_terms(config.get("Filters", "required_terms", fallback="rotational")),
         "exclude_bands": parse_band_numbers(config.get("Filters", "exclude_bands", fallback="6,7,8,9")),
+        "max_age_days": config.get("Filters", "max_age_days", fallback="7"),
         "llm_provider": config.get("LLM", "provider", fallback=""),
         "llm_api_key": config.get("LLM", "api_key", fallback=""),
         "llm_model": config.get("LLM", "model", fallback=""),
@@ -961,7 +961,7 @@ def main():
     exclude_bands = cfg.get("exclude_bands") or []
     max_jobs = int(os.environ.get("MAX_JOBS", "10"))
     max_candidates = int(os.environ.get("MAX_CANDIDATES", "50"))
-    max_age_days = int(os.environ.get("MAX_AGE_DAYS", "7"))
+    max_age_days = int(os.environ.get("MAX_AGE_DAYS") or cfg.get("max_age_days") or "7")
     today = datetime.date.today()
     # Only include adverts posted within the last MAX_AGE_DAYS days (inclusive).
     posted_cutoff = today - datetime.timedelta(days=max_age_days)

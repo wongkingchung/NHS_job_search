@@ -24,14 +24,14 @@ Single-file Python scraper (`nhs_job_search.py`) that searches [NHS Jobs](https:
 .venv\Scripts\python nhs_job_search.py
 ```
 
-Overrides via environment variables (Windows `set` syntax shown in README): `SEARCH_KEYWORD`, `SEARCH_URL`, `EXCLUDE_TERMS`, `MAX_JOBS` (default 10), `MAX_CANDIDATES` (default 50), `MAX_AGE_DAYS` (default 7), `NHS_OUTPUT_DIR` (relocate config/output).
+Overrides via environment variables (Windows `set` syntax shown in README): `SEARCH_KEYWORD`, `SEARCH_URL`, `EXCLUDE_TERMS`, `MAX_JOBS` (default 10), `MAX_CANDIDATES` (default 50), `MAX_AGE_DAYS` (overrides `max_age_days` under `[Filters]` in `config.ini`, default 7), `NHS_OUTPUT_DIR` (relocate config/output).
 
 ## Hard requirements and behaviour
 
 - **LLM is mandatory**: `main()` exits if `[LLM]` in `config.ini` is missing provider/API key/model. Supported: `kimi.ai`/`moonshot`, `openai`, or any OpenAI-compatible base URL.
 - **Login is optional**: NHS Jobs search is public; `[Login]` credentials only enable candidate-only features.
 - **Filtering** (all must hold): advert relates to the configured profession, mentions an included band (e.g. Band 5), mentions required terms (e.g. "rotational"); adverts mentioning excluded higher bands (6, 7+) are rejected. Exclusion terms (e.g. "respiratory") match against the **job title only**, not body text — do not change this without asking, it is deliberate.
-- **Date window**: only adverts posted within the last `MAX_AGE_DAYS` days (default 7) are processed. The date is read from the search result's `search-result-publicationDate` field and re-verified against the "Date posted" `h3`/`p` pair on the job page (`parse_posted_date` handles "7 August 2026" and "07/08/2026"). Jobs with unparseable dates are kept, not dropped.
+- **Date window**: only adverts posted within the last `max_age_days` days (default 7, set under `[Filters]` in `config.ini`; env var `MAX_AGE_DAYS` overrides) are processed. The date is read from the search result's `search-result-publicationDate` field and re-verified against the "Date posted" `h3`/`p` pair on the job page (`parse_posted_date` handles "7 August 2026" and "07/08/2026"). Jobs with unparseable dates are kept, not dropped.
 - **Sorting**: `sort=publicationDateDesc` is added to the search URL when absent (works with both `searchFormType=main` and `sortBy`), so results arrive newest-first; the report is sorted by date posted, descending.
 - **Politeness**: 1-second delay between requests; `MAX_RETRIES = 3` on HTTP errors. Keep this intact.
 - **Cumulative data, windowed report**: never overwrite `jobs_data.json` / `seen_references.json`; always merge. The HTML report shows only jobs posted within the date window (aged-out jobs remain in `jobs_data.json`). Report filenames include the run date (`YYYYMMDD`).
@@ -41,7 +41,7 @@ Overrides via environment variables (Windows `set` syntax shown in README): `SEA
 
 - Windows + Git Bash environment; Python 3.10+.
 - No test suite exists — verify changes by running the scraper with small limits, e.g. `MAX_JOBS=2 MAX_CANDIDATES=5`, and inspecting the generated report.
-- Configurable filters live in the `[Filters]` section (`profession`, `bands`, `required_terms`, `exclude_bands`); defaults target Band 5 rotational physiotherapy.
+- Configurable filters live in the `[Filters]` section (`profession`, `bands`, `required_terms`, `exclude_bands`, `max_age_days`); defaults target Band 5 rotational physiotherapy.
 - Keep the single-file structure; resist splitting into modules unless the user asks.
 
 ## When you change things

@@ -17,6 +17,8 @@ bands=5
 required_terms=rotational
 # Comma-separated band numbers to reject (e.g., when a higher band is mentioned).
 exclude_bands=6,7,8,9
+# Only process adverts posted within this many days (env var MAX_AGE_DAYS overrides).
+max_age_days=7
 
 [LLM]
 provider=kimi.ai
